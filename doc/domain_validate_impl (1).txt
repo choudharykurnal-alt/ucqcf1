@@ -1,0 +1,755 @@
+/**
+ * domains/domain_validate.c
+ * 
+ * Domain validation implementation
+ * 
+ * SECURITY PROPERTY:
+ *   If validation passes, the system cannot violate trust boundaries.
+ * 
+ * GUARANTEES:
+ *   - Deterministic (same input → same output)
+ *   - Complete (checks all invariants)
+ *   - Explicit (no implicit assumptions)
+ *   - Fast (suitable for boot-time execution)
+ */
+
+#include "domain_contract.h"
+#include <string.h>
+#include <stdio.h>
+
+/* ========================================================================
+ * VALIDATION CONTEXT MANAGEMENT
+ * ======================================================================== */
+
+static void validation_context_init(validation_context_t *ctx) {
+    ctx->error_count = 0;
+    ctx->worst_result = VALIDATION_ACCEPT;
+    memset(ctx->errors, 0, sizeof(ctx->errors));
+}
+
+static void validation_context_add_error(
+    validation_context_t *ctx,
+    validation_error_t error,
+    validation_result_t severity
+) {
+    if (ctx->error_count < 64) {
+        ctx->errors[ctx->error_count++] = error;
+    }
+    
+    if (severity > ctx->worst_result) {
+        ctx->worst_result = severity;
+    }
+}
+
+bool validation_context_allows_boot(const validation_context_t *ctx) {
+    return ctx->worst_result != VALIDATION_HARD_FAIL;
+}
+
+/* ========================================================================
+ * CORE SET OPERATIONS
+ * ======================================================================== */
+
+bool core_set_is_empty(const core_set_t *set) {
+    for (int i = 0; i < 4; i++) {
+        if (set->bitmap[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool core_set_contains(const core_set_t *set, core_id_t core) {
+    if (core >= MAX_DOMAIN_CORES) {
+        return false;
+    }
+    
+    uint32_t word = core / 64;
+    uint32_t bit = core % 64;
+    
+    return (set->bitmap[word] & (1ULL << bit)) != 0;
+}
+
+bool core_set_overlaps(const core_set_t *a, const core_set_t *b) {
+    for (int i = 0; i < 4; i++) {
+        if ((a->bitmap[i] & b->bitmap[i]) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool core_set_is_valid(const core_set_t *set, const boot_facts_t *boot) {
+    /* Check that all cores in set exist in hardware */
+    for (core_id_t core = 0; core < MAX_DOMAIN_CORES; core++) {
+        if (core_set_contains(set, core)) {
+            if (core >= boot->cpu_count) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void core_set_add(core_set_t *set, core_id_t core) {
+    if (core >= MAX_DOMAIN_CORES) {
+        return;
+    }
+    
+    uint32_t word = core / 64;
+    uint32_t bit = core % 64;
+    
+    set->bitmap[word] |= (1ULL << bit);
+    set->count++;
+    set->explicit = true;
+}
+
+void core_set_clear(core_set_t *set) {
+    memset(set->bitmap, 0, sizeof(set->bitmap));
+    set->count = 0;
+    set->explicit = false;
+}
+
+/* ========================================================================
+ * DEPENDENCY SET OPERATIONS
+ * ======================================================================== */
+
+bool dependency_set_is_empty(const dependency_set_t *deps) {
+    return deps->count == 0;
+}
+
+bool dependency_set_contains(const dependency_set_t *deps, domain_id_t id) {
+    for (uint32_t i = 0; i < deps->count; i++) {
+        if (deps->depends_on[i] == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void dependency_set_add(dependency_set_t *deps, domain_id_t id) {
+    if (deps->count < MAX_DEPENDENCIES) {
+        deps->depends_on[deps->count++] = id;
+        deps->explicit = true;
+    }
+}
+
+void dependency_set_clear(dependency_set_t *deps) {
+    deps->count = 0;
+    deps->explicit = false;
+    memset(deps->depends_on, 0xFF, sizeof(deps->depends_on));
+}
+
+/* ========================================================================
+ * DOMAIN GRAPH MANAGEMENT
+ * ======================================================================== */
+
+void domain_graph_init(
+    domain_graph_t *graph,
+    const boot_facts_t *boot_facts,
+    const topology_state_t *topology
+) {
+    memset(graph, 0, sizeof(domain_graph_t));
+    
+    graph->boot_facts = boot_facts;
+    graph->topology = topology;
+    graph->domain_count = 0;
+    graph->validated = false;
+    graph->sealed = false;
+}
+
+bool domain_graph_add(domain_graph_t *graph, const security_domain_t *domain) {
+    if (graph->domain_count >= MAX_DOMAINS) {
+        return false;
+    }
+    
+    if (graph->sealed) {
+        return false;
+    }
+    
+    graph->domains[graph->domain_count++] = *domain;
+    graph->validated = false;  /* Must revalidate after changes */
+    
+    return true;
+}
+
+const security_domain_t* domain_graph_get(
+    const domain_graph_t *graph,
+    domain_id_t id
+) {
+    for (uint32_t i = 0; i < graph->domain_count; i++) {
+        if (graph->domains[i].id == id) {
+            return &graph->domains[i];
+        }
+    }
+    return NULL;
+}
+
+/* ========================================================================
+ * FIELD VALIDATION (No Defaults Allowed)
+ * ======================================================================== */
+
+validation_result_t domain_validate_fields(
+    const security_domain_t *domain,
+    validation_context_t *ctx
+) {
+    validation_result_t result = VALIDATION_ACCEPT;
+    
+    /* Name must be explicitly set */
+    if (!domain->name_explicit || domain->name[0] == '\0') {
+        validation_context_add_error(ctx, VALIDATION_ERROR_NAME_EMPTY, 
+                                    VALIDATION_HARD_FAIL);
+        result = VALIDATION_HARD_FAIL;
+    }
+    
+    /* Security level must not be UNDEFINED */
+    if (domain->security_level == SECURITY_LEVEL_UNDEFINED) {
+        validation_context_add_error(ctx, 
+                                    VALIDATION_ERROR_SECURITY_LEVEL_UNDEFINED,
+                                    VALIDATION_HARD_FAIL);
+        result = VALIDATION_HARD_FAIL;
+    }
+    
+    /* Preemption policy must be explicit */
+    if (domain->preemption == PREEMPTION_UNDEFINED) {
+        validation_context_add_error(ctx, 
+                                    VALIDATION_ERROR_PREEMPTION_UNDEFINED,
+                                    VALIDATION_HARD_FAIL);
+        result = VALIDATION_HARD_FAIL;
+    }
+    
+    /* Core set must be explicitly set and non-empty */
+    if (!domain->cores.explicit) {
+        validation_context_add_error(ctx, VALIDATION_ERROR_FIELD_NOT_SET,
+                                    VALIDATION_HARD_FAIL);
+        result = VALIDATION_HARD_FAIL;
+    }
+    
+    if (core_set_is_empty(&domain->cores)) {
+        validation_context_add_error(ctx, VALIDATION_ERROR_CORES_EMPTY,
+                                    VALIDATION_HARD_FAIL);
+        result = VALIDATION_HARD_FAIL;
+    }
+    
+    /* Cache isolation must be explicit */
+    if (domain->cache_isolation == CACHE_ISOLATION_UNDEFINED) {
+        validation_context_add_error(ctx,
+                                    VALIDATION_ERROR_CACHE_ISOLATION_UNDEFINED,
+                                    VALIDATION_HARD_FAIL);
+        result = VALIDATION_HARD_FAIL;
+    }
+    
+    /* Memory type must be explicit */
+    if (domain->memory_type == MEMORY_DOMAIN_UNDEFINED) {
+        validation_context_add_error(ctx,
+                                    VALIDATION_ERROR_MEMORY_TYPE_UNDEFINED,
+                                    VALIDATION_HARD_FAIL);
+        result = VALIDATION_HARD_FAIL;
+    }
+    
+    /* NUMA locality must be explicit if referenced */
+    if (domain->numa_local && !domain->numa_local_explicit) {
+        validation_context_add_error(ctx, VALIDATION_ERROR_FIELD_NOT_SET,
+                                    VALIDATION_HARD_FAIL);
+        result = VALIDATION_HARD_FAIL;
+    }
+    
+    return result;
+}
+
+/* ========================================================================
+ * BOOT FACTS VALIDATION
+ * ======================================================================== */
+
+validation_result_t domain_validate_boot(
+    const security_domain_t *domain,
+    const boot_facts_t *boot_facts,
+    validation_context_t *ctx
+) {
+    validation_result_t result = VALIDATION_ACCEPT;
+    
+    if (!boot_facts) {
+        validation_context_add_error(ctx, VALIDATION_ERROR_BOOT_FACTS_NULL,
+                                    VALIDATION_HARD_FAIL);
+        return VALIDATION_HARD_FAIL;
+    }
+    
+    /* Verify all cores exist in hardware */
+    for (core_id_t core = 0; core < MAX_DOMAIN_CORES; core++) {
+        if (core_set_contains(&domain->cores, core)) {
+            if (core >= boot_facts->cpu_count) {
+                validation_context_add_error(ctx, 
+                                            VALIDATION_ERROR_CORE_NOT_EXIST,
+                                            VALIDATION_HARD_FAIL);
+                result = VALIDATION_HARD_FAIL;
+            }
+        }
+    }
+    
+    return result;
+}
+
+/* ========================================================================
+ * TOPOLOGY VALIDATION
+ * ======================================================================== */
+
+validation_result_t domain_validate_topology(
+    const security_domain_t *domain,
+    const topology_state_t *topology,
+    validation_context_t *ctx
+) {
+    validation_result_t result = VALIDATION_ACCEPT;
+    
+    if (!topology) {
+        validation_context_add_error(ctx, VALIDATION_ERROR_TOPOLOGY_NULL,
+                                    VALIDATION_HARD_FAIL);
+        return VALIDATION_HARD_FAIL;
+    }
+    
+    /* Validate cache isolation is achievable */
+    if (domain->cache_isolation >= CACHE_ISOLATION_L1) {
+        /* Check that all cores in domain satisfy isolation requirements */
+        for (core_id_t core_a = 0; core_a < MAX_DOMAIN_CORES; core_a++) {
+            if (!core_set_contains(&domain->cores, core_a)) {
+                continue;
+            }
+            
+            for (core_id_t core_b = 0; core_b < MAX_DOMAIN_CORES; core_b++) {
+                if (core_a == core_b) continue;
+                if (!core_set_contains(&domain->cores, core_b)) {
+                    continue;
+                }
+                
+                /* Check if cores share cache at prohibited level */
+                const core_geometry_t *geom_a = 
+                    topology_get_core_geometry(topology, core_a);
+                const core_geometry_t *geom_b = 
+                    topology_get_core_geometry(topology, core_b);
+                
+                if (!geom_a || !geom_b) {
+                    validation_context_add_error(ctx,
+                        VALIDATION_ERROR_CACHE_ISOLATION_UNSATISFIABLE,
+                        VALIDATION_HARD_FAIL);
+                    result = VALIDATION_HARD_FAIL;
+                    continue;
+                }
+                
+                /* Check cache sharing based on isolation requirement */
+                bool shares_prohibited_cache = false;
+                
+                switch (domain->cache_isolation) {
+                    case CACHE_ISOLATION_L1:
+                        shares_prohibited_cache = 
+                            (geom_a->l1_domain == geom_b->l1_domain);
+                        break;
+                    case CACHE_ISOLATION_L2:
+                        shares_prohibited_cache = 
+                            (geom_a->l2_domain == geom_b->l2_domain);
+                        break;
+                    case CACHE_ISOLATION_L3:
+                        shares_prohibited_cache = 
+                            (geom_a->l3_domain == geom_b->l3_domain);
+                        break;
+                    case CACHE_ISOLATION_FULL:
+                        shares_prohibited_cache = 
+                            (geom_a->l1_domain == geom_b->l1_domain) ||
+                            (geom_a->l2_domain == geom_b->l2_domain) ||
+                            (geom_a->l3_domain == geom_b->l3_domain);
+                        break;
+                    default:
+                        break;
+                }
+                
+                if (shares_prohibited_cache) {
+                    validation_context_add_error(ctx,
+                        VALIDATION_ERROR_CACHE_ISOLATION_UNSATISFIABLE,
+                        VALIDATION_HARD_FAIL);
+                    result = VALIDATION_HARD_FAIL;
+                }
+            }
+        }
+    }
+    
+    /* Validate NUMA constraints if required */
+    if (domain->numa_local) {
+        /* All cores must be on same NUMA node */
+        numa_node_t first_node = NUMA_NODE_INVALID;
+        
+        for (core_id_t core = 0; core < MAX_DOMAIN_CORES; core++) {
+            if (!core_set_contains(&domain->cores, core)) {
+                continue;
+            }
+            
+            const core_geometry_t *geom = 
+                topology_get_core_geometry(topology, core);
+            if (!geom) {
+                validation_context_add_error(ctx,
+                    VALIDATION_ERROR_NUMA_CONSTRAINT_VIOLATED,
+                    VALIDATION_HARD_FAIL);
+                result = VALIDATION_HARD_FAIL;
+                continue;
+            }
+            
+            if (first_node == NUMA_NODE_INVALID) {
+                first_node = geom->numa_node;
+            } else if (geom->numa_node != first_node) {
+                validation_context_add_error(ctx,
+                    VALIDATION_ERROR_NUMA_CONSTRAINT_VIOLATED,
+                    VALIDATION_HARD_FAIL);
+                result = VALIDATION_HARD_FAIL;
+            }
+        }
+    }
+    
+    return result;
+}
+
+/* ========================================================================
+ * DEPENDENCY VALIDATION
+ * ======================================================================== */
+
+validation_result_t domain_validate_dependencies(
+    const security_domain_t *domain,
+    const domain_graph_t *graph,
+    validation_context_t *ctx
+) {
+    validation_result_t result = VALIDATION_ACCEPT;
+    
+    /* Check for self-dependency */
+    if (dependency_set_contains(&domain->dependencies, domain->id)) {
+        validation_context_add_error(ctx, VALIDATION_ERROR_DEPENDENCY_SELF,
+                                    VALIDATION_HARD_FAIL);
+        result = VALIDATION_HARD_FAIL;
+    }
+    
+    /* Verify all dependencies exist */
+    for (uint32_t i = 0; i < domain->dependencies.count; i++) {
+        domain_id_t dep_id = domain->dependencies.depends_on[i];
+        
+        if (!domain_graph_get(graph, dep_id)) {
+            validation_context_add_error(ctx,
+                                        VALIDATION_ERROR_DEPENDENCY_NOT_EXIST,
+                                        VALIDATION_HARD_FAIL);
+            result = VALIDATION_HARD_FAIL;
+        }
+    }
+    
+    return result;
+}
+
+/* ========================================================================
+ * GRAPH-LEVEL VALIDATORS
+ * ======================================================================== */
+
+validation_result_t domain_graph_validate_no_overlap(
+    const domain_graph_t *graph,
+    validation_context_t *ctx
+) {
+    validation_result_t result = VALIDATION_ACCEPT;
+    
+    /* Check every pair of domains for overlapping cores */
+    for (uint32_t i = 0; i < graph->domain_count; i++) {
+        for (uint32_t j = i + 1; j < graph->domain_count; j++) {
+            const security_domain_t *domain_a = &graph->domains[i];
+            const security_domain_t *domain_b = &graph->domains[j];
+            
+            if (core_set_overlaps(&domain_a->cores, &domain_b->cores)) {
+                validation_context_add_error(ctx, 
+                                            VALIDATION_ERROR_CORES_OVERLAP,
+                                            VALIDATION_HARD_FAIL);
+                result = VALIDATION_HARD_FAIL;
+            }
+        }
+    }
+    
+    return result;
+}
+
+validation_result_t domain_graph_validate_acyclic(
+    const domain_graph_t *graph,
+    validation_context_t *ctx
+) {
+    /* Use depth-first search to detect cycles */
+    typedef enum {
+        VISIT_STATE_UNVISITED,
+        VISIT_STATE_VISITING,
+        VISIT_STATE_VISITED
+    } visit_state_t;
+    
+    visit_state_t states[MAX_DOMAINS];
+    for (uint32_t i = 0; i < MAX_DOMAINS; i++) {
+        states[i] = VISIT_STATE_UNVISITED;
+    }
+    
+    bool has_cycle = false;
+    
+    /* Helper: DFS visit function */
+    bool dfs_visit(domain_id_t id, visit_state_t *states, 
+                   const domain_graph_t *g) {
+        uint32_t index = 0;
+        for (uint32_t i = 0; i < g->domain_count; i++) {
+            if (g->domains[i].id == id) {
+                index = i;
+                break;
+            }
+        }
+        
+        if (states[index] == VISIT_STATE_VISITING) {
+            return true;  /* Cycle detected */
+        }
+        
+        if (states[index] == VISIT_STATE_VISITED) {
+            return false;  /* Already processed */
+        }
+        
+        states[index] = VISIT_STATE_VISITING;
+        
+        const security_domain_t *domain = &g->domains[index];
+        for (uint32_t i = 0; i < domain->dependencies.count; i++) {
+            domain_id_t dep_id = domain->dependencies.depends_on[i];
+            if (dfs_visit(dep_id, states, g)) {
+                return true;  /* Cycle found in subtree */
+            }
+        }
+        
+        states[index] = VISIT_STATE_VISITED;
+        return false;
+    }
+    
+    /* Check each domain as potential cycle start */
+    for (uint32_t i = 0; i < graph->domain_count; i++) {
+        if (states[i] == VISIT_STATE_UNVISITED) {
+            if (dfs_visit(graph->domains[i].id, states, graph)) {
+                has_cycle = true;
+                break;
+            }
+        }
+    }
+    
+    if (has_cycle) {
+        validation_context_add_error(ctx, 
+                                    VALIDATION_ERROR_DEPENDENCY_CIRCULAR,
+                                    VALIDATION_HARD_FAIL);
+        return VALIDATION_HARD_FAIL;
+    }
+    
+    return VALIDATION_ACCEPT;
+}
+
+validation_result_t domain_graph_validate_cache_isolation(
+    const domain_graph_t *graph,
+    validation_context_t *ctx
+) {
+    /* This is validated per-domain in domain_validate_topology */
+    /* This function validates cross-domain isolation */
+    
+    validation_result_t result = VALIDATION_ACCEPT;
+    
+    for (uint32_t i = 0; i < graph->domain_count; i++) {
+        const security_domain_t *domain = &graph->domains[i];
+        
+        result = domain_validate_topology(domain, graph->topology, ctx);
+        if (result == VALIDATION_HARD_FAIL) {
+            return VALIDATION_HARD_FAIL;
+        }
+    }
+    
+    return result;
+}
+
+/* ========================================================================
+ * MAIN VALIDATION FUNCTION
+ * ======================================================================== */
+
+validation_result_t domain_graph_validate(
+    domain_graph_t *graph,
+    validation_context_t *ctx
+) {
+    validation_context_init(ctx);
+    
+    /* Validate preconditions */
+    if (!graph->boot_facts) {
+        validation_context_add_error(ctx, VALIDATION_ERROR_BOOT_FACTS_NULL,
+                                    VALIDATION_HARD_FAIL);
+        return VALIDATION_HARD_FAIL;
+    }
+    
+    if (!graph->topology) {
+        validation_context_add_error(ctx, VALIDATION_ERROR_TOPOLOGY_NULL,
+                                    VALIDATION_HARD_FAIL);
+        return VALIDATION_HARD_FAIL;
+    }
+    
+    /* Check domain count */
+    if (graph->domain_count == 0) {
+        /* No domains is technically valid but unusual */
+        validation_context_add_error(ctx, VALIDATION_WARN_UNUSED_CORES,
+                                    VALIDATION_WARN);
+    }
+    
+    /* Validate each domain individually */
+    for (uint32_t i = 0; i < graph->domain_count; i++) {
+        security_domain_t *domain = &graph->domains[i];
+        
+        domain_validate_fields(domain, ctx);
+        domain_validate_boot(domain, graph->boot_facts, ctx);
+        domain_validate_topology(domain, graph->topology, ctx);
+        domain_validate_dependencies(domain, graph, ctx);
+        
+        /* Mark domain as validated if no hard failures */
+        if (ctx->worst_result != VALIDATION_HARD_FAIL) {
+            domain->validated = true;
+        }
+    }
+    
+    /* Validate graph-level properties */
+    domain_graph_validate_no_overlap(graph, ctx);
+    domain_graph_validate_acyclic(graph, ctx);
+    domain_graph_validate_cache_isolation(graph, ctx);
+    
+    /* Mark graph as validated if successful */
+    if (ctx->worst_result != VALIDATION_HARD_FAIL) {
+        graph->validated = true;
+    }
+    
+    return ctx->worst_result;
+}
+
+/* ========================================================================
+ * SEALING
+ * ======================================================================== */
+
+bool domain_graph_seal(domain_graph_t *graph) {
+    if (!graph->validated) {
+        return false;
+    }
+    
+    if (graph->sealed) {
+        return false;  /* Already sealed */
+    }
+    
+    /* Mark all domains as sealed */
+    for (uint32_t i = 0; i < graph->domain_count; i++) {
+        graph->domains[i].sealed = true;
+    }
+    
+    graph->sealed = true;
+    return true;
+}
+
+/* ========================================================================
+ * ERROR REPORTING
+ * ======================================================================== */
+
+const char* validation_error_string(validation_error_t error) {
+    switch (error) {
+        case VALIDATION_ERROR_NONE:
+            return "No error";
+        case VALIDATION_ERROR_FIELD_NOT_SET:
+            return "Required field not explicitly set";
+        case VALIDATION_ERROR_NAME_EMPTY:
+            return "Domain name is empty";
+        case VALIDATION_ERROR_CORES_EMPTY:
+            return "Domain has no cores assigned";
+        case VALIDATION_ERROR_SECURITY_LEVEL_UNDEFINED:
+            return "Security level not defined";
+        case VALIDATION_ERROR_CACHE_ISOLATION_UNDEFINED:
+            return "Cache isolation requirement not defined";
+        case VALIDATION_ERROR_MEMORY_TYPE_UNDEFINED:
+            return "Memory domain type not defined";
+        case VALIDATION_ERROR_PREEMPTION_UNDEFINED:
+            return "Preemption policy not defined";
+        case VALIDATION_ERROR_CORE_NOT_EXIST:
+            return "Core does not exist in hardware";
+        case VALIDATION_ERROR_CORES_OVERLAP:
+            return "Core assigned to multiple domains";
+        case VALIDATION_ERROR_CACHE_ISOLATION_UNSATISFIABLE:
+            return "Cache isolation requirement cannot be satisfied by topology";
+        case VALIDATION_ERROR_NUMA_CONSTRAINT_VIOLATED:
+            return "NUMA locality constraint violated";
+        case VALIDATION_ERROR_DEPENDENCY_NOT_EXIST:
+            return "Dependency references non-existent domain";
+        case VALIDATION_ERROR_DEPENDENCY_CIRCULAR:
+            return "Circular dependency detected";
+        case VALIDATION_ERROR_DEPENDENCY_SELF:
+            return "Domain depends on itself";
+        case VALIDATION_ERROR_DUPLICATE_ID:
+            return "Duplicate domain ID";
+        case VALIDATION_ERROR_TOO_MANY_DOMAINS:
+            return "Too many domains";
+        case VALIDATION_ERROR_BOOT_FACTS_NULL:
+            return "Boot facts not initialized";
+        case VALIDATION_ERROR_TOPOLOGY_NULL:
+            return "Topology not initialized";
+        case VALIDATION_WARN_UNUSED_CORES:
+            return "Warning: Some cores are not assigned to any domain";
+        case VALIDATION_WARN_ASYMMETRIC_TOPOLOGY:
+            return "Warning: Topology is asymmetric";
+        default:
+            return "Unknown error";
+    }
+}
+
+void validation_context_print(const validation_context_t *ctx) {
+    printf("Validation summary: %u error(s)\n", ctx->error_count);
+    printf("Worst result: ");
+    
+    switch (ctx->worst_result) {
+        case VALIDATION_ACCEPT:
+            printf("ACCEPT\n");
+            break;
+        case VALIDATION_WARN:
+            printf("WARN\n");
+            break;
+        case VALIDATION_HARD_FAIL:
+            printf("HARD_FAIL\n");
+            break;
+    }
+    
+    for (uint32_t i = 0; i < ctx->error_count; i++) {
+        printf("  [%u] %s\n", i, validation_error_string(ctx->errors[i]));
+    }
+}
+
+/* ========================================================================
+ * QUERY FUNCTIONS
+ * ======================================================================== */
+
+bool domain_graph_can_access(
+    const domain_graph_t *graph,
+    domain_id_t from,
+    domain_id_t to
+) {
+    if (!graph->validated) {
+        return false;
+    }
+    
+    const security_domain_t *from_domain = domain_graph_get(graph, from);
+    const security_domain_t *to_domain = domain_graph_get(graph, to);
+    
+    if (!from_domain || !to_domain) {
+        return false;
+    }
+    
+    /* Check if 'from' depends on 'to' */
+    return dependency_set_contains(&from_domain->dependencies, to);
+}
+
+bool domain_graph_cores_isolated(
+    const domain_graph_t *graph,
+    domain_id_t a,
+    domain_id_t b
+) {
+    if (!graph->validated) {
+        return false;
+    }
+    
+    const security_domain_t *domain_a = domain_graph_get(graph, a);
+    const security_domain_t *domain_b = domain_graph_get(graph, b);
+    
+    if (!domain_a || !domain_b) {
+        return false;
+    }
+    
+    /* Cores are isolated if they don't overlap */
+    return !core_set_overlaps(&domain_a->cores, &domain_b->cores);
+}

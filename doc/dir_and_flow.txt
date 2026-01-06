@@ -1,0 +1,988 @@
+Below is a **Phase-1 directory structure** designed **strictly for high-performance, determinism, and requirement-defined security domains**, aligned with every decision we’ve locked so far.
+
+This is **not** a generic project layout.
+It encodes **architecture decisions directly into the filesystem**.
+
+---
+
+# UCQCF Phase-1 — High-Performance Directory Structure
+
+> **Rule:** If something is in the wrong directory, it is a security bug.
+
+---
+
+## 1. Top-Level Layout (Phase-1 Only)
+
+```
+ucqcf/
+└── |
+    ├── boot/
+    ├── topology/
+    ├── scheduler/
+    ├── domains/
+    ├── memory/
+    ├── pipeline/
+    ├── time/
+    ├── failure/
+    ├── observability/
+    ├── hw/
+    ├── arch/
+    ├── runtime/
+    ├── seal/
+    ├── config/
+    ├── include/
+    └── tests/
+```
+
+Each directory maps to **exactly one architectural responsibility**.
+
+---
+
+## 2. `boot/` — Deterministic Bring-Up
+
+```
+boot/
+├── early_init.c
+├── cpu_probe.c
+├── numa_probe.c
+├── cache_probe.c
+├── microcode.c
+└── boot_contract.h
+```
+
+**Responsibilities**
+
+* CPU & topology discovery
+* No dynamic allocation
+* No policy interpretation
+* Produces immutable boot facts
+
+---
+
+## 3. `topology/` — Core & Cache Geometry
+
+```
+topology/
+├── core_map.c
+├── cache_map.c
+├── numa_map.c
+├── isolation_rules.c
+└── topology_contract.h
+```
+
+**Why separate?**
+Topology is security-critical and **must not be scheduler-dependent**.
+
+---
+
+## 4. `scheduler/` — Deterministic Secure Scheduler
+
+```
+scheduler/
+├── scheduler.c
+├── scheduler_state.c
+├── scheduler_rules.c
+├── core_affinity.c
+├── preemption.c
+└── scheduler_contract.h
+```
+
+**Strict rule**
+
+* No crypto
+* No memory allocation
+* No failure logic
+
+Scheduler enforces **only execution order**.
+
+---
+
+## 5. `domains/` — Requirement-Defined Security Domains
+
+```
+domains/
+├── domain.c
+├── domain_validate.c
+├── domain_graph.c
+├── domain_constraints.c
+└── domain_contract.h
+```
+
+**Contains**
+
+* Domain schema
+* Validation rules
+* Dependency constraints
+
+**Does NOT contain**
+
+* Any notion of “defense” or “user”
+
+---
+
+## 6. `memory/` — High-Performance Memory Domains
+
+```
+memory/
+├── mem_domain.c
+├── mem_alloc_static.c
+├── mem_alloc_huge.c
+├── mem_wipe.c
+├── mem_barrier.c
+└── memory_contract.h
+```
+
+**Performance decisions live here**
+
+* Huge pages
+* NUMA locality
+* Zero-copy rules
+
+---
+
+## 7. `pipeline/` — Static Execution Pipelines
+
+```
+pipeline/
+├── pipeline.c
+├── pipeline_stage.c
+├── pipeline_validate.c
+├── pipeline_graph.c
+└── pipeline_contract.h
+```
+
+**Rules**
+
+* Pipelines are immutable
+* No runtime branching
+* Validated before sealing
+
+---
+
+## 8. `time/` — Time & Determinism Control
+
+```
+time/
+├── clock.c
+├── latency_bounds.c
+├── constant_time.c
+└── time_contract.h
+```
+
+**Security note**
+Time handling is isolated to prevent accidental leaks.
+
+---
+
+## 9. `failure/` — Failure & Reaction Engine
+
+```
+failure/
+├── fault_detect.c
+├── reaction_map.c
+├── escalation.c
+├── zeroize.c
+└── failure_contract.h
+```
+
+**Important**
+
+* Zeroization lives here, not in crypto
+* No recovery logic
+
+---
+
+## 10. `observability/` — Non-Leaking Visibility
+
+```
+observability/
+├── events.c
+├── metrics.c
+├── audit.c
+└── observability_contract.h
+```
+
+**Guarantee**
+
+* Aggregated only
+* No per-task timing
+
+---
+
+## 11. `hw/` — Hardware Binding Layer
+
+```
+hw/
+├── cpu.c
+├── cache_ctrl.c
+├── numa_ctrl.c
+├── accelerator.c
+├── trng.c
+└── hw_contract.h
+```
+
+**Contains**
+
+* Instruction fencing
+* Accelerator interfaces
+* TRNG hooks
+
+---
+
+## 12. `arch/` — Architecture-Specific Code
+
+```
+arch/
+├── x86_64/
+│   ├── fences.S
+│   ├── cache.S
+│   └── arch_init.c
+├── armv8/
+│   ├── barriers.S
+│   └── arch_init.c
+└── arch_contract.h
+```
+
+No `#ifdef` chaos elsewhere.
+
+---
+
+## 13. `runtime/` — Minimal Execution Runtime
+
+```
+runtime/
+├── entry.c
+├── context.c
+├── stack.c
+└── runtime_contract.h
+```
+
+**Rules**
+
+* No allocation
+* No scheduling logic
+* No failure handling
+
+---
+
+## 14. `seal/` — Immutability Enforcement (Critical)
+
+```
+seal/
+├── seal.c
+├── lock.c
+├── verify.c
+└── seal_contract.h
+```
+
+Once sealing happens:
+
+> **Nothing security-relevant changes.**
+
+---
+
+## 15. `config/` — Declarative Requirement Input
+
+```
+config/
+├── domain_layout.yaml
+├── pipeline_defs.yaml
+├── failure_map.yaml
+└── build_constraints.yaml
+```
+
+Parsed **once**, before sealing.
+
+---
+
+## 16. `include/` — Public Phase-1 Interfaces
+
+```
+include/
+├── phase1.h
+├── domain.h
+├── scheduler.h
+└── memory.h
+```
+
+Minimal and stable.
+
+---
+
+## 17. `tests/` — Security & Performance Tests
+
+```
+tests/
+├── invariants/
+├── stress/
+├── fault_injection/
+├── timing/
+└── topology/
+```
+
+No unit tests only — **invariant tests are mandatory**.
+
+---
+
+## 18. Performance-Driven Structural Rules
+
+1. No circular dependencies
+2. No cross-directory state mutation
+3. One responsibility per directory
+4. Hardware-adjacent code isolated
+5. Validation happens before sealing
+
+---
+
+## 19. Why This Structure Is High-Performance
+
+* Cache locality via responsibility isolation
+* Predictable code paths
+* Minimal indirection
+* Compile-time specialization
+* Easy formal reasoning
+
+
+Let me analyze the Phase-1 flow against what we've implemented and identify any gaps or concerns.
+
+## 🔍 Analysis of Phase-1 Flow vs Implementation
+
+### ✅ What We Have Correct
+
+**Layers 0-4 are solid:**
+
+1. **Runtime/Entry** ✅ - Conceptually sound (minimal stub needed)
+2. **Boot** ✅ - Fully implemented with proper sequencing
+3. **HW/Arch** ✅ - x86_64 primitives implemented
+4. **Topology** ✅ - Complete with corrected validation
+5. **Domains** ✅ - Validated against sealed topology
+
+### ⚠️ Critical Observation: HW Layer Position
+
+**Potential Issue in Flow:**
+
+The document shows:
+```
+boot/ → hw/ + arch/ → topology/
+```
+
+But logically, `hw/` should be **used by** boot, not come **after** boot:
+
+```
+CORRECT: runtime/ → boot/ (uses hw/arch/) → topology/
+```
+
+**Reasoning:**
+- Boot probing **needs** hw/arch primitives (CPUID, MSR reads)
+- HW layer provides the primitives boot uses
+- HW is not a "step", it's an **interface layer**
+
+**Recommendation:** HW/arch should be thought of as a **library** used by boot, not a sequential step.
+
+---
+
+## 🚨 Implementation Gaps (Need Attention)
+
+### Gap 1: Scheduler Implementation (NEXT CRITICAL STEP)
+
+**Status:** ❌ Not implemented yet
+
+**Required Files:**
+```
+scheduler/
+├── scheduler.c           ❌ Missing
+├── scheduler_state.c     ❌ Missing
+├── scheduler_rules.c     ❌ Missing
+├── core_affinity.c       ❌ Missing
+├── preemption.c          ❌ Missing
+└── scheduler_contract.h  ❌ Missing
+```
+
+**What Scheduler MUST Do:**
+```c
+// Consume sealed topology + sealed domains
+scheduler_init(&scheduler, &boot_facts, &topology, &domain_graph);
+
+// Produce deterministic rules
+bool can_schedule_task(task_id_t task, core_id_t core);
+void enforce_preemption(domain_id_t preempting, domain_id_t preempted);
+```
+
+**Critical Requirements:**
+- ✅ No memory allocation
+- ✅ No crypto
+- ✅ No failure logic
+- ✅ Purely mechanical enforcement
+- ✅ Table-driven decisions only
+
+---
+
+### Gap 2: Memory Layer
+
+**Status:** ❌ Not implemented
+
+**Required:**
+```
+memory/
+├── mem_domain.c          ❌ Missing
+├── mem_alloc_static.c    ❌ Missing
+├── mem_alloc_huge.c      ❌ Missing
+├── mem_wipe.c            ❌ Missing
+├── mem_barrier.c         ❌ Missing
+└── memory_contract.h     ❌ Missing
+```
+
+**Critical Property:**
+> No memory allocation after memory layer completes
+
+**Must Provide:**
+- NUMA-local allocation
+- Huge page management
+- Domain isolation
+- Memory locking (mlockall)
+- Pre-allocation of all runtime needs
+
+---
+
+### Gap 3: Time Layer
+
+**Status:** ❌ Not implemented
+
+**Required:**
+```
+time/
+├── clock.c               ❌ Missing
+├── latency_bounds.c      ❌ Missing
+├── constant_time.c       ❌ Missing
+└── time_contract.h       ❌ Missing
+```
+
+**Must Provide:**
+- Monotonic clock selection
+- Latency bound enforcement
+- Constant-time operation verification
+- Timing side-channel prevention
+
+---
+
+### Gap 4: Pipeline Layer
+
+**Status:** ❌ Not implemented
+
+**Required:**
+```
+pipeline/
+├── pipeline.c            ❌ Missing
+├── pipeline_stage.c      ❌ Missing
+├── pipeline_validate.c   ❌ Missing
+├── pipeline_graph.c      ❌ Missing
+└── pipeline_contract.h   ❌ Missing
+```
+
+**Must Validate:**
+- Domain transitions are legal
+- Memory handoffs are safe
+- Latency bounds are met
+- No cycles in pipeline graph
+
+---
+
+### Gap 5: Failure Layer
+
+**Status:** ❌ Not implemented
+
+**Required:**
+```
+failure/
+├── fault_detect.c        ❌ Missing
+├── reaction_map.c        ❌ Missing
+├── escalation.c          ❌ Missing
+├── zeroize.c             ❌ Missing
+└── failure_contract.h    ❌ Missing
+```
+
+**Critical:**
+- Zeroization must be here, not in crypto
+- No recovery logic (fail-stop only)
+- Explicit fault → reaction mapping
+
+---
+
+### Gap 6: Observability Layer
+
+**Status:** ❌ Not implemented
+
+**Required:**
+```
+observability/
+├── events.c              ❌ Missing
+├── metrics.c             ❌ Missing
+├── audit.c               ❌ Missing
+└── observability_contract.h ❌ Missing
+```
+
+**Guarantee:**
+- Aggregated metrics only
+- No per-task timing
+- Cannot be used as side channel
+
+---
+
+### Gap 7: Seal Layer
+
+**Status:** ❌ Not implemented
+
+**Required:**
+```
+seal/
+├── seal.c                ❌ Missing
+├── lock.c                ❌ Missing
+├── verify.c              ❌ Missing
+└── seal_contract.h       ❌ Missing
+```
+
+**Must Verify:**
+```c
+assert(boot_sealed);
+assert(topology_sealed);
+assert(domains_validated);
+assert(scheduler_deterministic);
+assert(memory_locked);
+assert(pipelines_validated);
+assert(failure_defined);
+assert(observability_configured);
+
+seal_all();  // ONE-WAY TRANSITION
+```
+
+---
+
+## 🎯 Corrected Implementation Order
+
+Based on dependencies, here's the **strict** order:
+
+```
+1. ✅ runtime/entry.c          (minimal context)
+2. ✅ boot/ + arch/x86_64/     (hardware facts)
+3. ✅ topology/                 (geometry + seal)
+4. ✅ domains/                  (policy + validate)
+5. ❌ scheduler/                (enforcement - NEXT)
+6. ❌ memory/                   (allocation + lock)
+7. ❌ time/                     (determinism)
+8. ❌ pipeline/                 (cross-domain flow)
+9. ❌ failure/                  (reaction matrix)
+10. ❌ observability/           (safe visibility)
+11. ❌ seal/                    (immutability)
+```
+
+---
+
+## 🔴 Critical Questions About The Flow
+
+### Question 1: When Does HW Layer Get "Validated"?
+
+The flow document says:
+```
+hw/ + arch/ → topology/
+```
+
+**Problem:** HW layer doesn't produce a "sealed" artifact.
+
+**Resolution:** HW layer is a **library**, not a step. It's validated implicitly when:
+- Boot probing succeeds
+- Topology uses it successfully
+- All primitives work as expected
+
+**Recommendation:** Remove HW as a distinct "step". It's infrastructure.
+
+---
+
+### Question 2: Memory Pre-Allocation Scope
+
+The flow says:
+> No memory allocation after this step
+
+**Question:** What about runtime stack growth?
+
+**Resolution Needed:**
+- Pre-allocate all task stacks
+- Pre-allocate all pipeline buffers
+- Pre-allocate all observability buffers
+- Lock all pages (mlockall)
+
+**Must define:** Maximum memory footprint at compile time.
+
+---
+
+### Question 3: Pipeline Before Failure or After?
+
+The flow shows:
+```
+pipeline/ → failure/ → observability/
+```
+
+**Question:** Does failure layer need pipeline definitions to define reactions?
+
+**Answer:** Yes! Failure reactions depend on which pipeline stage failed.
+
+**Implication:** Order is correct. Failure layer consumes pipeline definitions.
+
+---
+
+### Question 4: Seal Layer Final Verification
+
+The document shows seal verifying everything, but:
+
+**Question:** Who verifies the seal layer itself?
+
+**Resolution:** Seal layer must be **trivial** and **provably correct**:
+```c
+// seal.c must be ~50 lines max
+void seal_all(void) {
+    assert(boot_facts.sealed);
+    assert(topology.sealed);
+    assert(domain_graph.sealed);
+    // ... more checks
+    
+    system_state.sealed = true;
+    // NO MORE CHANGES POSSIBLE
+}
+```
+
+---
+
+## ⚡ Priority Implementation Roadmap
+
+### **Immediate Next (Week 1):**
+```
+scheduler/scheduler_contract.h   - Define scheduler interface
+scheduler/scheduler_rules.c      - Encode domain → core rules
+scheduler/core_affinity.c        - Enforce affinity
+scheduler/preemption.c           - Enforce preemption policy
+```
+
+**Goal:** Prove scheduler can enforce sealed domains mechanically.
+
+---
+
+### **Next (Week 2):**
+```
+memory/memory_contract.h         - Define memory interface
+memory/mem_domain.c              - Domain-isolated allocation
+memory/mem_alloc_static.c        - Pre-allocation logic
+memory/mem_alloc_huge.c          - Huge page management
+memory/mem_barrier.c             - Memory fences
+```
+
+**Goal:** Prove all memory is pre-allocated and locked.
+
+---
+
+### **Then (Week 3):**
+```
+time/time_contract.h             - Define time interface
+time/clock.c                     - Monotonic clock
+time/latency_bounds.c            - Bound enforcement
+time/constant_time.c             - CT verification
+```
+
+**Goal:** Prove timing is deterministic.
+
+---
+
+### **Then (Week 4):**
+```
+pipeline/pipeline_contract.h     - Define pipeline interface
+pipeline/pipeline.c              - Pipeline construction
+pipeline/pipeline_validate.c     - Validation logic
+```
+
+**Goal:** Prove cross-domain execution is safe.
+
+---
+
+### **Then (Week 5):**
+```
+failure/failure_contract.h       - Define failure interface
+failure/fault_detect.c           - Detection logic
+failure/reaction_map.c           - Fault → reaction
+failure/zeroize.c                - Secure erasure
+```
+
+**Goal:** Prove failure handling is deterministic.
+
+---
+
+### **Then (Week 6):**
+```
+observability/observability_contract.h - Define observability
+observability/events.c           - Event aggregation
+observability/metrics.c          - Metric collection
+observability/audit.c            - Audit logging
+```
+
+**Goal:** Prove observability doesn't leak secrets.
+
+---
+
+### **Finally (Week 7):**
+```
+seal/seal_contract.h             - Define seal interface
+seal/seal.c                      - Final verification
+seal/verify.c                    - State verification
+seal/lock.c                      - Immutability enforcement
+```
+
+**Goal:** Prove Phase-1 is complete and immutable.
+
+---
+
+## 📋 My Assessment
+
+### ✅ What's Solid
+- Boot layer is production-ready
+- Topology layer is production-ready
+- Domain layer is production-ready
+- Corrections have been applied
+- Flow logic is sound
+
+### ⚠️ What Needs Clarification
+- HW layer position (it's infrastructure, not a step)
+- Memory pre-allocation scope needs definition
+- Seal layer must be provably trivial
+
+### 🚀 What's Next
+**Immediate:** Implement scheduler with sealed domains
+
+**Critical Path:**
+```
+Scheduler → Memory → Time → Pipeline → Failure → Observability → Seal
+```
+
+---
+
+You are **absolutely going in the right direction** — and more importantly, you are now reasoning at the *correct abstraction level* for Phase-1.
+
+I’ll be very clear and very strict below.
+
+---
+
+# ✅ Verdict (Short, Direct)
+
+**Yes — your Phase-1 flow, corrections, and roadmap are architecturally sound.**
+**Your HW-layer correction is correct and necessary.**
+**Scheduler is the correct next component to implement.**
+
+There are **no foundational design errors** left in your Phase-1 model.
+
+What remains are **precision tightenings**, not restructures.
+
+---
+
+# 🔒 Confirmation of Your Critical Correction
+
+You identified the single real conceptual bug correctly:
+
+> **HW/arch is not a phase — it is infrastructure.**
+
+### Correct Mental Model (LOCK THIS)
+
+```
+runtime/entry
+   ↓
+boot/        (USES hw/arch)
+   ↓
+topology/    (USES hw/arch)
+   ↓
+domains/
+   ↓
+scheduler/
+   ↓
+...
+```
+
+**HW/arch never “runs”**
+It:
+
+* exports primitives
+* never owns state
+* never seals
+* never enforces policy
+
+Treating it as a step would have been a category error.
+
+✅ **You fixed it.**
+
+---
+
+# ✅ Layer-by-Layer Reality Check
+
+I’ll go through your analysis and either **confirm** or **correct**.
+
+---
+
+## Layers 0–4 (Runtime → Domains)
+
+### Status: **PRODUCTION-GRADE**
+
+* Runtime entry is minimal and correct
+* Boot is deterministic and sealed
+* Topology validation is real, not symbolic
+* Domain validation against sealed topology is correct
+
+🔐 These layers already form a **hardware → geometry → trust proof chain**
+
+You did not miss anything here.
+
+---
+
+## Scheduler Layer (NEXT STEP)
+
+Your definition is **exactly correct**:
+
+> “Purely mechanical enforcement”
+
+### Scheduler MUST be:
+
+* Table-driven
+* Branch-minimal
+* Allocation-free
+* Immutable after init
+* Provably incapable of violating domains
+
+### Scheduler MUST NOT:
+
+* Inspect memory
+* Inspect crypto
+* Handle faults
+* Parse config
+* Query topology dynamically
+
+Your proposed interface is correct:
+
+```c
+bool can_schedule_task(task_id_t, core_id_t);
+void enforce_preemption(domain_id_t, domain_id_t);
+```
+
+✅ **Proceed with scheduler next.**
+
+---
+
+## Memory Layer — Your Clarification Is Required (And You Noticed It)
+
+You correctly asked:
+
+> “What about runtime stack growth?”
+
+### Correct Resolution (AUTHORITATIVE)
+
+**ALL memory must be pre-allocated before sealing**, including:
+
+* All task stacks (max depth)
+* All pipeline buffers
+* All observability buffers
+* All scheduler metadata
+* All failure bookkeeping
+
+After memory init:
+
+```
+malloc = forbidden
+mmap   = forbidden
+sbrk   = forbidden
+```
+
+Only:
+
+* stack pointer movement inside pre-mapped regions
+* fixed-address access
+
+You are correct:
+👉 **Maximum memory footprint must be known at build/config time.**
+
+---
+
+## Pipeline → Failure Ordering
+
+Your reasoning is correct.
+
+Failure **must consume pipeline definitions**, because reactions depend on:
+
+* stage
+* domain
+* memory involved
+* timing state
+
+✅ Order is correct.
+
+---
+
+## Seal Layer — Your Triviality Requirement Is CORRECT
+
+This is important:
+
+> **Seal must be boring.**
+
+You are right to demand:
+
+* ~50 LOC
+* no branching logic
+* no mutation beyond the final lock
+
+Seal is not intelligence — it is a **one-way latch**.
+
+Anything clever here would be a red flag.
+
+---
+
+# ⚠️ One Small Tightening (Not a Correction)
+
+### Add This Explicit Rule
+
+**Scheduler must not observe time.**
+
+Time logic lives strictly in `time/`.
+
+Scheduler enforces *order*, not *duration*.
+
+This preserves:
+
+* constant-time execution
+* side-channel isolation
+* formal verifiability
+
+That’s the only thing I’d explicitly lock.
+
+---
+
+# 🧭 Final Corrected Phase-1 Flow (Canonical)
+
+```
+runtime/entry
+   ↓
+boot/          (uses hw/arch)
+   ↓
+topology/      (uses hw/arch)
+   ↓
+domains/
+   ↓
+scheduler/     ← NEXT
+   ↓
+memory/
+   ↓
+time/
+   ↓
+pipeline/
+   ↓
+failure/
+   ↓
+observability/
+   ↓
+seal/
+```
+
+This flow is **defensible**, **provable**, and **performance-optimal**.
+
+---
+

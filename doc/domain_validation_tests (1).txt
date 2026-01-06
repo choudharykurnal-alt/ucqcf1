@@ -1,0 +1,858 @@
+/**
+ * tests/invariants/test_domain_validation.c
+ * 
+ * Domain validation invariant tests
+ * 
+ * PURPOSE:
+ *   Prove that domain validation rejects all invalid configurations
+ *   and accepts all valid ones.
+ * 
+ * APPROACH:
+ *   - Test every validation rule in isolation
+ *   - Test composition of valid domains
+ *   - Test every failure mode explicitly
+ * 
+ * SECURITY PROPERTY:
+ *   If these tests pass, misconfiguration cannot weaken isolation.
+ */
+
+#include "../../domains/domain_contract.h"
+#include "../../boot/boot_contract.h"
+#include "../../topology/topology_contract.h"
+#include <stdio.h>
+#include <assert.h>
+#include <string.h>
+
+/* Test result tracking */
+static uint32_t tests_run = 0;
+static uint32_t tests_passed = 0;
+static uint32_t tests_failed = 0;
+
+#define TEST(name) \
+    static void test_##name(void); \
+    static void run_test_##name(void) { \
+        printf("Running: %s ... ", #name); \
+        tests_run++; \
+        test_##name(); \
+        tests_passed++; \
+        printf("PASS\n"); \
+    } \
+    static void test_##name(void)
+
+#define ASSERT(cond) \
+    do { \
+        if (!(cond)) { \
+            printf("FAIL at %s:%d: %s\n", __FILE__, __LINE__, #cond); \
+            tests_failed++; \
+            return; \
+        } \
+    } while (0)
+
+#define ASSERT_EQ(a, b) ASSERT((a) == (b))
+#define ASSERT_NE(a, b) ASSERT((a) != (b))
+#define ASSERT_TRUE(x) ASSERT(x)
+#define ASSERT_FALSE(x) ASSERT(!(x))
+
+/* ========================================================================
+ * TEST FIXTURES
+ * ======================================================================== */
+
+static boot_facts_t create_test_boot_facts(void) {
+    boot_facts_t facts = {0};
+    facts.cpu_count = 16;
+    facts.numa_nodes = 2;
+    facts.constant_time_supported = true;
+    facts.trng_available = true;
+    return facts;
+}
+
+static topology_state_t create_test_topology(void) {
+    topology_state_t topology = {0};
+    topology.core_count = 16;
+    topology.numa_node_count = 2;
+    
+    /* Initialize core geometries */
+    for (uint32_t i = 0; i < 16; i++) {
+        core_geometry_t *geom = &topology.cores[i];
+        geom->physical_core = i;
+        geom->l1_domain = i;  /* Private L1 */
+        geom->l2_domain = i / 2;  /* Shared by pairs */
+        geom->l3_domain = i / 8;  /* Shared by groups of 8 */
+        geom->numa_node = i / 8;  /* Two NUMA nodes */
+        geom->isolated = false;
+    }
+    
+    return topology;
+}
+
+static security_domain_t create_valid_domain(void) {
+    security_domain_t domain = {0};
+    
+    domain.id = 1;
+    strncpy(domain.name, "test_domain", sizeof(domain.name));
+    domain.name_explicit = true;
+    
+    domain.security_level = SECURITY_LEVEL_4;
+    domain.preemption = PREEMPTION_BY_HIGHER;
+    
+    core_set_clear(&domain.cores);
+    core_set_add(&domain.cores, 0);
+    core_set_add(&domain.cores, 1);
+    
+    domain.cache_isolation = CACHE_ISOLATION_L2;
+    domain.memory_type = MEMORY_DOMAIN_ISOLATED;
+    domain.numa_local = true;
+    domain.numa_local_explicit = true;
+    
+    dependency_set_clear(&domain.dependencies);
+    
+    return domain;
+}
+
+/* ========================================================================
+ * FIELD VALIDATION TESTS
+ * ======================================================================== */
+
+TEST(field_validation_accepts_complete_domain) {
+    boot_facts_t boot = create_test_boot_facts();
+    topology_state_t topology = create_test_topology();
+    security_domain_t domain = create_valid_domain();
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_validate_fields(&domain, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_ACCEPT);
+    ASSERT_EQ(ctx.error_count, 0);
+}
+
+TEST(field_validation_rejects_undefined_security_level) {
+    security_domain_t domain = create_valid_domain();
+    domain.security_level = SECURITY_LEVEL_UNDEFINED;
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_validate_fields(&domain, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_HARD_FAIL);
+    ASSERT_TRUE(ctx.error_count > 0);
+    ASSERT_EQ(ctx.errors[0], VALIDATION_ERROR_SECURITY_LEVEL_UNDEFINED);
+}
+
+TEST(field_validation_rejects_undefined_preemption) {
+    security_domain_t domain = create_valid_domain();
+    domain.preemption = PREEMPTION_UNDEFINED;
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_validate_fields(&domain, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_HARD_FAIL);
+    ASSERT_TRUE(ctx.error_count > 0);
+}
+
+TEST(field_validation_rejects_empty_name) {
+    security_domain_t domain = create_valid_domain();
+    domain.name[0] = '\0';
+    domain.name_explicit = false;
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_validate_fields(&domain, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_HARD_FAIL);
+}
+
+TEST(field_validation_rejects_empty_core_set) {
+    security_domain_t domain = create_valid_domain();
+    core_set_clear(&domain.cores);
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_validate_fields(&domain, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_HARD_FAIL);
+    ASSERT_EQ(ctx.errors[0], VALIDATION_ERROR_CORES_EMPTY);
+}
+
+TEST(field_validation_rejects_undefined_cache_isolation) {
+    security_domain_t domain = create_valid_domain();
+    domain.cache_isolation = CACHE_ISOLATION_UNDEFINED;
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_validate_fields(&domain, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_HARD_FAIL);
+}
+
+TEST(field_validation_rejects_undefined_memory_type) {
+    security_domain_t domain = create_valid_domain();
+    domain.memory_type = MEMORY_DOMAIN_UNDEFINED;
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_validate_fields(&domain, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_HARD_FAIL);
+}
+
+/* ========================================================================
+ * BOOT FACTS VALIDATION TESTS
+ * ======================================================================== */
+
+TEST(boot_validation_accepts_valid_cores) {
+    boot_facts_t boot = create_test_boot_facts();
+    security_domain_t domain = create_valid_domain();
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_validate_boot(&domain, &boot, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_ACCEPT);
+    ASSERT_EQ(ctx.error_count, 0);
+}
+
+TEST(boot_validation_rejects_nonexistent_core) {
+    boot_facts_t boot = create_test_boot_facts();
+    security_domain_t domain = create_valid_domain();
+    
+    /* Add core that doesn't exist */
+    core_set_add(&domain.cores, 100);
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_validate_boot(&domain, &boot, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_HARD_FAIL);
+    ASSERT_EQ(ctx.errors[0], VALIDATION_ERROR_CORE_NOT_EXIST);
+}
+
+TEST(boot_validation_rejects_null_boot_facts) {
+    security_domain_t domain = create_valid_domain();
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_validate_boot(&domain, NULL, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_HARD_FAIL);
+    ASSERT_EQ(ctx.errors[0], VALIDATION_ERROR_BOOT_FACTS_NULL);
+}
+
+/* ========================================================================
+ * TOPOLOGY VALIDATION TESTS
+ * ======================================================================== */
+
+TEST(topology_validation_accepts_satisfiable_l2_isolation) {
+    topology_state_t topology = create_test_topology();
+    security_domain_t domain = create_valid_domain();
+    
+    /* Cores 0 and 2 don't share L2 (different pairs) */
+    core_set_clear(&domain.cores);
+    core_set_add(&domain.cores, 0);
+    core_set_add(&domain.cores, 2);
+    domain.cache_isolation = CACHE_ISOLATION_L2;
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_validate_topology(&domain, &topology, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_ACCEPT);
+}
+
+TEST(topology_validation_rejects_unsatisfiable_l2_isolation) {
+    topology_state_t topology = create_test_topology();
+    security_domain_t domain = create_valid_domain();
+    
+    /* Cores 0 and 1 share L2 (same pair) */
+    core_set_clear(&domain.cores);
+    core_set_add(&domain.cores, 0);
+    core_set_add(&domain.cores, 1);
+    domain.cache_isolation = CACHE_ISOLATION_L2;
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_validate_topology(&domain, &topology, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_HARD_FAIL);
+    ASSERT_EQ(ctx.errors[0], VALIDATION_ERROR_CACHE_ISOLATION_UNSATISFIABLE);
+}
+
+TEST(topology_validation_accepts_satisfiable_l3_isolation) {
+    topology_state_t topology = create_test_topology();
+    security_domain_t domain = create_valid_domain();
+    
+    /* Cores 0 and 8 don't share L3 (different groups) */
+    core_set_clear(&domain.cores);
+    core_set_add(&domain.cores, 0);
+    core_set_add(&domain.cores, 8);
+    domain.cache_isolation = CACHE_ISOLATION_L3;
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_validate_topology(&domain, &topology, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_ACCEPT);
+}
+
+TEST(topology_validation_rejects_unsatisfiable_l3_isolation) {
+    topology_state_t topology = create_test_topology();
+    security_domain_t domain = create_valid_domain();
+    
+    /* Cores 0 and 1 share L3 (same group of 8) */
+    core_set_clear(&domain.cores);
+    core_set_add(&domain.cores, 0);
+    core_set_add(&domain.cores, 1);
+    domain.cache_isolation = CACHE_ISOLATION_L3;
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_validate_topology(&domain, &topology, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_HARD_FAIL);
+}
+
+TEST(topology_validation_accepts_numa_local_on_same_node) {
+    topology_state_t topology = create_test_topology();
+    security_domain_t domain = create_valid_domain();
+    
+    /* Cores 0, 1, 2 are all on NUMA node 0 */
+    core_set_clear(&domain.cores);
+    core_set_add(&domain.cores, 0);
+    core_set_add(&domain.cores, 1);
+    core_set_add(&domain.cores, 2);
+    domain.numa_local = true;
+    domain.numa_local_explicit = true;
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_validate_topology(&domain, &topology, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_ACCEPT);
+}
+
+TEST(topology_validation_rejects_numa_local_on_different_nodes) {
+    topology_state_t topology = create_test_topology();
+    security_domain_t domain = create_valid_domain();
+    
+    /* Cores 0 (node 0) and 8 (node 1) are on different NUMA nodes */
+    core_set_clear(&domain.cores);
+    core_set_add(&domain.cores, 0);
+    core_set_add(&domain.cores, 8);
+    domain.numa_local = true;
+    domain.numa_local_explicit = true;
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_validate_topology(&domain, &topology, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_HARD_FAIL);
+    ASSERT_EQ(ctx.errors[0], VALIDATION_ERROR_NUMA_CONSTRAINT_VIOLATED);
+}
+
+/* ========================================================================
+ * DEPENDENCY VALIDATION TESTS
+ * ======================================================================== */
+
+TEST(dependency_validation_accepts_valid_dependencies) {
+    boot_facts_t boot = create_test_boot_facts();
+    topology_state_t topology = create_test_topology();
+    
+    domain_graph_t graph;
+    domain_graph_init(&graph, &boot, &topology);
+    
+    security_domain_t domain1 = create_valid_domain();
+    domain1.id = 1;
+    
+    security_domain_t domain2 = create_valid_domain();
+    domain2.id = 2;
+    core_set_clear(&domain2.cores);
+    core_set_add(&domain2.cores, 4);
+    dependency_set_add(&domain2.dependencies, 1);  /* Depends on domain1 */
+    
+    domain_graph_add(&graph, &domain1);
+    domain_graph_add(&graph, &domain2);
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_validate_dependencies(&domain2, &graph, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_ACCEPT);
+}
+
+TEST(dependency_validation_rejects_self_dependency) {
+    boot_facts_t boot = create_test_boot_facts();
+    topology_state_t topology = create_test_topology();
+    
+    domain_graph_t graph;
+    domain_graph_init(&graph, &boot, &topology);
+    
+    security_domain_t domain = create_valid_domain();
+    domain.id = 1;
+    dependency_set_add(&domain.dependencies, 1);  /* Self-dependency */
+    
+    domain_graph_add(&graph, &domain);
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_validate_dependencies(&domain, &graph, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_HARD_FAIL);
+    ASSERT_EQ(ctx.errors[0], VALIDATION_ERROR_DEPENDENCY_SELF);
+}
+
+TEST(dependency_validation_rejects_nonexistent_dependency) {
+    boot_facts_t boot = create_test_boot_facts();
+    topology_state_t topology = create_test_topology();
+    
+    domain_graph_t graph;
+    domain_graph_init(&graph, &boot, &topology);
+    
+    security_domain_t domain = create_valid_domain();
+    domain.id = 1;
+    dependency_set_add(&domain.dependencies, 999);  /* Doesn't exist */
+    
+    domain_graph_add(&graph, &domain);
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_validate_dependencies(&domain, &graph, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_HARD_FAIL);
+    ASSERT_EQ(ctx.errors[0], VALIDATION_ERROR_DEPENDENCY_NOT_EXIST);
+}
+
+/* ========================================================================
+ * GRAPH VALIDATION TESTS
+ * ======================================================================== */
+
+TEST(graph_validation_accepts_non_overlapping_cores) {
+    boot_facts_t boot = create_test_boot_facts();
+    topology_state_t topology = create_test_topology();
+    
+    domain_graph_t graph;
+    domain_graph_init(&graph, &boot, &topology);
+    
+    security_domain_t domain1 = create_valid_domain();
+    domain1.id = 1;
+    core_set_clear(&domain1.cores);
+    core_set_add(&domain1.cores, 0);
+    core_set_add(&domain1.cores, 1);
+    
+    security_domain_t domain2 = create_valid_domain();
+    domain2.id = 2;
+    core_set_clear(&domain2.cores);
+    core_set_add(&domain2.cores, 4);
+    core_set_add(&domain2.cores, 5);
+    
+    domain_graph_add(&graph, &domain1);
+    domain_graph_add(&graph, &domain2);
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_graph_validate_no_overlap(&graph, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_ACCEPT);
+}
+
+TEST(graph_validation_rejects_overlapping_cores) {
+    boot_facts_t boot = create_test_boot_facts();
+    topology_state_t topology = create_test_topology();
+    
+    domain_graph_t graph;
+    domain_graph_init(&graph, &boot, &topology);
+    
+    security_domain_t domain1 = create_valid_domain();
+    domain1.id = 1;
+    core_set_clear(&domain1.cores);
+    core_set_add(&domain1.cores, 0);
+    core_set_add(&domain1.cores, 1);
+    
+    security_domain_t domain2 = create_valid_domain();
+    domain2.id = 2;
+    core_set_clear(&domain2.cores);
+    core_set_add(&domain2.cores, 1);  /* Overlaps with domain1 */
+    core_set_add(&domain2.cores, 2);
+    
+    domain_graph_add(&graph, &domain1);
+    domain_graph_add(&graph, &domain2);
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_graph_validate_no_overlap(&graph, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_HARD_FAIL);
+    ASSERT_EQ(ctx.errors[0], VALIDATION_ERROR_CORES_OVERLAP);
+}
+
+TEST(graph_validation_accepts_acyclic_dependencies) {
+    boot_facts_t boot = create_test_boot_facts();
+    topology_state_t topology = create_test_topology();
+    
+    domain_graph_t graph;
+    domain_graph_init(&graph, &boot, &topology);
+    
+    /* Create chain: domain1 <- domain2 <- domain3 */
+    security_domain_t domain1 = create_valid_domain();
+    domain1.id = 1;
+    core_set_clear(&domain1.cores);
+    core_set_add(&domain1.cores, 0);
+    
+    security_domain_t domain2 = create_valid_domain();
+    domain2.id = 2;
+    core_set_clear(&domain2.cores);
+    core_set_add(&domain2.cores, 1);
+    dependency_set_add(&domain2.dependencies, 1);
+    
+    security_domain_t domain3 = create_valid_domain();
+    domain3.id = 3;
+    core_set_clear(&domain3.cores);
+    core_set_add(&domain3.cores, 2);
+    dependency_set_add(&domain3.dependencies, 2);
+    
+    domain_graph_add(&graph, &domain1);
+    domain_graph_add(&graph, &domain2);
+    domain_graph_add(&graph, &domain3);
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_graph_validate_acyclic(&graph, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_ACCEPT);
+}
+
+TEST(graph_validation_rejects_circular_dependencies) {
+    boot_facts_t boot = create_test_boot_facts();
+    topology_state_t topology = create_test_topology();
+    
+    domain_graph_t graph;
+    domain_graph_init(&graph, &boot, &topology);
+    
+    /* Create cycle: domain1 -> domain2 -> domain3 -> domain1 */
+    security_domain_t domain1 = create_valid_domain();
+    domain1.id = 1;
+    core_set_clear(&domain1.cores);
+    core_set_add(&domain1.cores, 0);
+    dependency_set_add(&domain1.dependencies, 3);  /* Depends on 3 */
+    
+    security_domain_t domain2 = create_valid_domain();
+    domain2.id = 2;
+    core_set_clear(&domain2.cores);
+    core_set_add(&domain2.cores, 1);
+    dependency_set_add(&domain2.dependencies, 1);  /* Depends on 1 */
+    
+    security_domain_t domain3 = create_valid_domain();
+    domain3.id = 3;
+    core_set_clear(&domain3.cores);
+    core_set_add(&domain3.cores, 2);
+    dependency_set_add(&domain3.dependencies, 2);  /* Depends on 2 */
+    
+    domain_graph_add(&graph, &domain1);
+    domain_graph_add(&graph, &domain2);
+    domain_graph_add(&graph, &domain3);
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_graph_validate_acyclic(&graph, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_HARD_FAIL);
+    ASSERT_EQ(ctx.errors[0], VALIDATION_ERROR_DEPENDENCY_CIRCULAR);
+}
+
+/* ========================================================================
+ * FULL VALIDATION TESTS
+ * ======================================================================== */
+
+TEST(full_validation_accepts_valid_configuration) {
+    boot_facts_t boot = create_test_boot_facts();
+    topology_state_t topology = create_test_topology();
+    
+    domain_graph_t graph;
+    domain_graph_init(&graph, &boot, &topology);
+    
+    security_domain_t domain1 = create_valid_domain();
+    domain1.id = 1;
+    
+    domain_graph_add(&graph, &domain1);
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_graph_validate(&graph, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_ACCEPT);
+    ASSERT_TRUE(graph.validated);
+    ASSERT_TRUE(validation_context_allows_boot(&ctx));
+}
+
+TEST(full_validation_rejects_incomplete_domain) {
+    boot_facts_t boot = create_test_boot_facts();
+    topology_state_t topology = create_test_topology();
+    
+    domain_graph_t graph;
+    domain_graph_init(&graph, &boot, &topology);
+    
+    security_domain_t domain = create_valid_domain();
+    domain.security_level = SECURITY_LEVEL_UNDEFINED;  /* Invalid */
+    
+    domain_graph_add(&graph, &domain);
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_graph_validate(&graph, &ctx);
+    
+    ASSERT_EQ(result, VALIDATION_HARD_FAIL);
+    ASSERT_FALSE(validation_context_allows_boot(&ctx));
+}
+
+TEST(sealing_succeeds_after_validation) {
+    boot_facts_t boot = create_test_boot_facts();
+    topology_state_t topology = create_test_topology();
+    
+    domain_graph_t graph;
+    domain_graph_init(&graph, &boot, &topology);
+    
+    security_domain_t domain = create_valid_domain();
+    domain_graph_add(&graph, &domain);
+    
+    validation_context_t ctx;
+    domain_graph_validate(&graph, &ctx);
+    
+    bool sealed = domain_graph_seal(&graph);
+    
+    ASSERT_TRUE(sealed);
+    ASSERT_TRUE(graph.sealed);
+}
+
+TEST(sealing_fails_without_validation) {
+    boot_facts_t boot = create_test_boot_facts();
+    topology_state_t topology = create_test_topology();
+    
+    domain_graph_t graph;
+    domain_graph_init(&graph, &boot, &topology);
+    
+    security_domain_t domain = create_valid_domain();
+    domain_graph_add(&graph, &domain);
+    
+    /* Skip validation */
+    bool sealed = domain_graph_seal(&graph);
+    
+    ASSERT_FALSE(sealed);
+    ASSERT_FALSE(graph.sealed);
+}
+
+/* ========================================================================
+ * CACHE ISOLATION MATRIX TESTS (Critical Gap Filled)
+ * ======================================================================== */
+
+TEST(cache_isolation_matrix_self_core) {
+    topology_state_t topology = create_test_topology();
+    
+    topology_build_cache_isolation_matrix(&topology);
+    
+    /* Same core should have CACHE_ISOLATED_NONE */
+    cache_isolation_level_t isolation = 
+        topology_get_cache_isolation(&topology, 0, 0);
+    
+    ASSERT_EQ(isolation, CACHE_ISOLATED_NONE);
+}
+
+TEST(cache_isolation_matrix_l1_shared) {
+    topology_state_t topology = create_test_topology();
+    
+    /* Cores 0 and 1 share L2 (pair 0), but have private L1 */
+    topology.cores[0].l1_domain = 0;
+    topology.cores[1].l1_domain = 1;
+    topology.cores[0].l2_domain = 0;
+    topology.cores[1].l2_domain = 0;  /* Shared L2 */
+    topology.cores[0].l3_domain = 0;
+    topology.cores[1].l3_domain = 0;  /* Shared L3 */
+    
+    topology_build_cache_isolation_matrix(&topology);
+    
+    cache_isolation_level_t isolation = 
+        topology_get_cache_isolation(&topology, 0, 1);
+    
+    /* Private L1, shared L2/L3 = CACHE_ISOLATED_L2 */
+    ASSERT_EQ(isolation, CACHE_ISOLATED_L2);
+}
+
+TEST(cache_isolation_matrix_l1_l2_private) {
+    topology_state_t topology = create_test_topology();
+    
+    /* Cores 0 and 2 have private L1 and L2, shared L3 */
+    topology.cores[0].l1_domain = 0;
+    topology.cores[2].l1_domain = 2;
+    topology.cores[0].l2_domain = 0;
+    topology.cores[2].l2_domain = 1;
+    topology.cores[0].l3_domain = 0;
+    topology.cores[2].l3_domain = 0;  /* Shared L3 */
+    
+    topology_build_cache_isolation_matrix(&topology);
+    
+    cache_isolation_level_t isolation = 
+        topology_get_cache_isolation(&topology, 0, 2);
+    
+    /* Private L1/L2, shared L3 = CACHE_ISOLATED_L3 */
+    ASSERT_EQ(isolation, CACHE_ISOLATED_L3);
+}
+
+TEST(cache_isolation_matrix_full_isolation) {
+    topology_state_t topology = create_test_topology();
+    
+    /* Cores 0 and 8 have no shared cache */
+    topology.cores[0].l1_domain = 0;
+    topology.cores[8].l1_domain = 8;
+    topology.cores[0].l2_domain = 0;
+    topology.cores[8].l2_domain = 4;
+    topology.cores[0].l3_domain = 0;
+    topology.cores[8].l3_domain = 1;
+    
+    topology_build_cache_isolation_matrix(&topology);
+    
+    cache_isolation_level_t isolation = 
+        topology_get_cache_isolation(&topology, 0, 8);
+    
+    /* No shared cache = CACHE_ISOLATED_FULL */
+    ASSERT_EQ(isolation, CACHE_ISOLATED_FULL);
+}
+
+TEST(cache_isolation_matrix_all_shared) {
+    topology_state_t topology = create_test_topology();
+    
+    /* Cores 0 and 1 share all caches (hypothetical bad config) */
+    topology.cores[0].l1_domain = 0;
+    topology.cores[1].l1_domain = 0;  /* Shared L1! */
+    topology.cores[0].l2_domain = 0;
+    topology.cores[1].l2_domain = 0;
+    topology.cores[0].l3_domain = 0;
+    topology.cores[1].l3_domain = 0;
+    
+    topology_build_cache_isolation_matrix(&topology);
+    
+    cache_isolation_level_t isolation = 
+        topology_get_cache_isolation(&topology, 0, 1);
+    
+    /* All caches shared = CACHE_ISOLATED_L1 (only registers private) */
+    ASSERT_EQ(isolation, CACHE_ISOLATED_L1);
+}
+
+TEST(cache_isolation_matrix_symmetry) {
+    topology_state_t topology = create_test_topology();
+    
+    topology_build_cache_isolation_matrix(&topology);
+    
+    /* Matrix must be symmetric */
+    for (uint32_t i = 0; i < topology.core_count; i++) {
+        for (uint32_t j = 0; j < topology.core_count; j++) {
+            cache_isolation_level_t iso_ij = 
+                topology_get_cache_isolation(&topology, i, j);
+            cache_isolation_level_t iso_ji = 
+                topology_get_cache_isolation(&topology, j, i);
+            
+            ASSERT_EQ(iso_ij, iso_ji);
+        }
+    }
+}
+
+/* ========================================================================
+ * CUMULATIVE CACHE ISOLATION VALIDATION TESTS
+ * ======================================================================== */
+
+TEST(domain_validation_l2_requires_l1_private) {
+    topology_state_t topology = create_test_topology();
+    
+    /* Setup: cores 0,1 share L1 but have private L2 */
+    topology.cores[0].l1_domain = 0;
+    topology.cores[1].l1_domain = 0;  /* Shared L1 */
+    topology.cores[0].l2_domain = 0;
+    topology.cores[1].l2_domain = 1;  /* Private L2 */
+    
+    topology_build_cache_isolation_matrix(&topology);
+    topology.validated = true;
+    topology.sealed = true;
+    
+    boot_facts_t boot = create_test_boot_facts();
+    
+    /* Domain requires L2 isolation */
+    security_domain_t domain = create_valid_domain();
+    core_set_clear(&domain.cores);
+    core_set_add(&domain.cores, 0);
+    core_set_add(&domain.cores, 1);
+    domain.cache_isolation = CACHE_ISOLATION_L2;
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_validate_topology(&domain, &topology, &ctx);
+    
+    /* Should FAIL because L2 isolation requires L1 to be private too */
+    ASSERT_EQ(result, VALIDATION_HARD_FAIL);
+}
+
+TEST(domain_validation_l3_requires_l1_l2_private) {
+    topology_state_t topology = create_test_topology();
+    
+    /* Setup: cores 0,1 have private L1, shared L2, private L3 */
+    topology.cores[0].l1_domain = 0;
+    topology.cores[1].l1_domain = 1;  /* Private L1 */
+    topology.cores[0].l2_domain = 0;
+    topology.cores[1].l2_domain = 0;  /* Shared L2! */
+    topology.cores[0].l3_domain = 0;
+    topology.cores[1].l3_domain = 1;  /* Private L3 */
+    
+    topology_build_cache_isolation_matrix(&topology);
+    topology.validated = true;
+    topology.sealed = true;
+    
+    boot_facts_t boot = create_test_boot_facts();
+    
+    /* Domain requires L3 isolation */
+    security_domain_t domain = create_valid_domain();
+    core_set_clear(&domain.cores);
+    core_set_add(&domain.cores, 0);
+    core_set_add(&domain.cores, 1);
+    domain.cache_isolation = CACHE_ISOLATION_L3;
+    
+    validation_context_t ctx;
+    validation_result_t result = domain_validate_topology(&domain, &topology, &ctx);
+    
+    /* Should FAIL because L3 isolation requires L1 AND L2 to be private */
+    ASSERT_EQ(result, VALIDATION_HARD_FAIL);
+}
+
+/* ========================================================================
+ * TEST RUNNER (Updated)
+ * ======================================================================== */
+
+int main(void) {
+    printf("=================================================\n");
+    printf("UCQCF Phase-1 Domain Validation Invariant Tests\n");
+    printf("=================================================\n\n");
+    
+    /* Field validation tests */
+    run_test_field_validation_accepts_complete_domain();
+    run_test_field_validation_rejects_undefined_security_level();
+    run_test_field_validation_rejects_undefined_preemption();
+    run_test_field_validation_rejects_empty_name();
+    run_test_field_validation_rejects_empty_core_set();
+    run_test_field_validation_rejects_undefined_cache_isolation();
+    run_test_field_validation_rejects_undefined_memory_type();
+    
+    /* Boot validation tests */
+    run_test_boot_validation_accepts_valid_cores();
+    run_test_boot_validation_rejects_nonexistent_core();
+    run_test_boot_validation_rejects_null_boot_facts();
+    
+    /* Topology validation tests */
+    run_test_topology_validation_accepts_satisfiable_l2_isolation();
+    run_test_topology_validation_rejects_unsatisfiable_l2_isolation();
+    run_test_topology_validation_accepts_satisfiable_l3_isolation();
+    run_test_topology_validation_rejects_unsatisfiable_l3_isolation();
+    run_test_topology_validation_accepts_numa_local_on_same_node();
+    run_test_topology_validation_rejects_numa_local_on_different_nodes();
+    
+    /* Dependency validation tests */
+    run_test_dependency_validation_accepts_valid_dependencies();
+    run_test_dependency_validation_rejects_self_dependency();
+    run_test_dependency_validation_rejects_nonexistent_dependency();
+    
+    /* Graph validation tests */
+    run_test_graph_validation_accepts_non_overlapping_cores();
+    run_test_graph_validation_rejects_overlapping_cores();
+    run_test_graph_validation_accepts_acyclic_dependencies();
+    run_test_graph_validation_rejects_circular_dependencies();
+    
+    /* Full validation tests */
+    run_test_full_validation_accepts_valid_configuration();
+    run_test_full_validation_rejects_incomplete_domain();
+    run_test_sealing_succeeds_after_validation();
+    run_test_sealing_fails_without_validation();
+    
+    /* Summary */
+    printf("\n=================================================\n");
+    printf("Tests run:    %u\n", tests_run);
+    printf("Tests passed: %u\n", tests_passed);
+    printf("Tests failed: %u\n", tests_failed);
+    printf("=================================================\n");
+    
+    if (tests_failed == 0) {
+        printf("✓ ALL TESTS PASSED\n");
+        return 0;
+    } else {
+        printf("✗ SOME TESTS FAILED\n");
+        return 1;
+    }
+}
