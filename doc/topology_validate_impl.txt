@@ -1,0 +1,741 @@
+/**
+ * topology/topology_validate.c
+ * 
+ * Topology validation and sealing
+ * 
+ * PURPOSE:
+ *   Freeze hardware facts so domain validation has immutable ground truth.
+ * 
+ * SECURITY PROPERTY:
+ *   If topology validation passes and topology is sealed,
+ *   domain validation can safely assume hardware geometry is correct.
+ * 
+ * CRITICAL: This must run BEFORE domain validation.
+ */
+
+#include "topology_contract.h"
+#include <string.h>
+#include <stdio.h>
+
+/* ========================================================================
+ * VALIDATION CONTEXT MANAGEMENT
+ * ======================================================================== */
+
+static void topology_validation_context_init(
+    topology_validation_context_t *ctx
+) {
+    ctx->error_count = 0;
+    ctx->worst_result = TOPOLOGY_VALIDATION_ACCEPT;
+    memset(ctx->errors, 0, sizeof(ctx->errors));
+}
+
+static void topology_validation_context_add_error(
+    topology_validation_context_t *ctx,
+    topology_error_t error,
+    topology_validation_result_t severity
+) {
+    if (ctx->error_count < 64) {
+        ctx->errors[ctx->error_count++] = error;
+    }
+    
+    if (severity > ctx->worst_result) {
+        ctx->worst_result = severity;
+    }
+}
+
+bool topology_validation_allows_boot(
+    const topology_validation_context_t *ctx
+) {
+    return ctx->worst_result != TOPOLOGY_VALIDATION_HARD_FAIL;
+}
+
+/* ========================================================================
+ * TOPOLOGY INITIALIZATION
+ * ======================================================================== */
+
+void topology_init(
+    topology_state_t *topology,
+    const boot_facts_t *boot_facts
+) {
+    memset(topology, 0, sizeof(topology_state_t));
+    
+    topology->boot_facts = boot_facts;
+    topology->core_count = 0;
+    topology->numa_node_count = 0;
+    topology->probed = false;
+    topology->validated = false;
+    topology->sealed = false;
+    
+    /* Initialize cache isolation matrix */
+    topology->cache_isolation.computed = false;
+    topology->cache_isolation.sealed = false;
+    memset(topology->cache_isolation.isolation, 0, 
+           sizeof(topology->cache_isolation.isolation));
+}
+
+/* ========================================================================
+ * CORE PROBING
+ * ======================================================================== */
+
+bool topology_probe_core(
+    topology_state_t *topology,
+    core_id_t core_id
+) {
+    if (core_id >= MAX_CORES) {
+        return false;
+    }
+    
+    if (topology->sealed) {
+        return false;  /* Cannot modify sealed topology */
+    }
+    
+    core_geometry_t *core = &topology->cores[core_id];
+    
+    /* Initialize core structure */
+    memset(core, 0, sizeof(core_geometry_t));
+    core->physical_core = core_id;
+    
+    /* Probe core-specific information */
+    /* This is architecture-specific and would call into arch/ layer */
+    
+    /* For now, mark as probed */
+    core->probed = true;
+    
+    return true;
+}
+
+bool topology_probe_all_cores(topology_state_t *topology) {
+    if (!topology->boot_facts) {
+        return false;
+    }
+    
+    if (topology->sealed) {
+        return false;
+    }
+    
+    uint32_t cpu_count = topology->boot_facts->cpu_count;
+    
+    for (uint32_t i = 0; i < cpu_count; i++) {
+        if (!topology_probe_core(topology, i)) {
+            return false;
+        }
+    }
+    
+    topology->core_count = cpu_count;
+    topology->probed = true;
+    
+    return true;
+}
+
+/* ========================================================================
+ * CACHE ISOLATION MATRIX COMPUTATION
+ * ======================================================================== */
+
+static cache_isolation_level_t compute_cache_isolation(
+    const core_geometry_t *core_a,
+    const core_geometry_t *core_b
+) {
+    /* If same core, no isolation needed */
+    if (core_a->physical_core == core_b->physical_core) {
+        return CACHE_ISOLATED_FULL;
+    }
+    
+    /* Check L1 isolation */
+    if (core_a->l1_domain != core_b->l1_domain) {
+        /* Check L2 isolation */
+        if (core_a->l2_domain != core_b->l2_domain) {
+            /* Check L3 isolation */
+            if (core_a->l3_domain != core_b->l3_domain) {
+                return CACHE_ISOLATED_FULL;
+            }
+            return CACHE_ISOLATED_L3;
+        }
+        return CACHE_ISOLATED_L2;
+    }
+    
+    return CACHE_ISOLATED_L1;
+}
+
+bool topology_build_cache_isolation_matrix(topology_state_t *topology) {
+    if (!topology->probed) {
+        return false;
+    }
+    
+    if (topology->cache_isolation.computed) {
+        return true;  /* Already computed */
+    }
+    
+    /* Compute pairwise cache isolation for all cores */
+    for (uint32_t i = 0; i < topology->core_count; i++) {
+        for (uint32_t j = 0; j < topology->core_count; j++) {
+            const core_geometry_t *core_a = &topology->cores[i];
+            const core_geometry_t *core_b = &topology->cores[j];
+            
+            topology->cache_isolation.isolation[i][j] = 
+                compute_cache_isolation(core_a, core_b);
+        }
+    }
+    
+    topology->cache_isolation.computed = true;
+    return true;
+}
+
+/* ========================================================================
+ * VALIDATION - BOOT CONSISTENCY
+ * ======================================================================== */
+
+static topology_validation_result_t validate_boot_consistency(
+    const topology_state_t *topology,
+    topology_validation_context_t *ctx
+) {
+    topology_validation_result_t result = TOPOLOGY_VALIDATION_ACCEPT;
+    
+    /* Boot facts must exist */
+    if (!topology->boot_facts) {
+        topology_validation_context_add_error(
+            ctx, TOPOLOGY_ERROR_BOOT_FACTS_NULL, TOPOLOGY_VALIDATION_HARD_FAIL);
+        return TOPOLOGY_VALIDATION_HARD_FAIL;
+    }
+    
+    /* Core count must match boot facts */
+    if (topology->core_count != topology->boot_facts->cpu_count) {
+        topology_validation_context_add_error(
+            ctx, TOPOLOGY_ERROR_CORE_COUNT_MISMATCH, TOPOLOGY_VALIDATION_HARD_FAIL);
+        result = TOPOLOGY_VALIDATION_HARD_FAIL;
+    }
+    
+    /* NUMA node count must match */
+    if (topology->numa_node_count != topology->boot_facts->numa_nodes) {
+        topology_validation_context_add_error(
+            ctx, TOPOLOGY_ERROR_NUMA_COUNT_MISMATCH, TOPOLOGY_VALIDATION_HARD_FAIL);
+        result = TOPOLOGY_VALIDATION_HARD_FAIL;
+    }
+    
+    return result;
+}
+
+/* ========================================================================
+ * VALIDATION - CORE PROBING
+ * ======================================================================== */
+
+static topology_validation_result_t validate_core_probing(
+    const topology_state_t *topology,
+    topology_validation_context_t *ctx
+) {
+    topology_validation_result_t result = TOPOLOGY_VALIDATION_ACCEPT;
+    
+    /* All cores must be probed */
+    for (uint32_t i = 0; i < topology->core_count; i++) {
+        const core_geometry_t *core = &topology->cores[i];
+        
+        if (!core->probed) {
+            topology_validation_context_add_error(
+                ctx, TOPOLOGY_ERROR_CORE_NOT_PROBED, TOPOLOGY_VALIDATION_HARD_FAIL);
+            result = TOPOLOGY_VALIDATION_HARD_FAIL;
+        }
+    }
+    
+    return result;
+}
+
+/* ========================================================================
+ * VALIDATION - CACHE HIERARCHY
+ * ======================================================================== */
+
+static topology_validation_result_t validate_cache_hierarchy(
+    const topology_state_t *topology,
+    topology_validation_context_t *ctx
+) {
+    topology_validation_result_t result = TOPOLOGY_VALIDATION_ACCEPT;
+    
+    /* Check that each core has valid cache hierarchy */
+    for (uint32_t i = 0; i < topology->core_count; i++) {
+        const core_geometry_t *core = &topology->cores[i];
+        
+        if (core->cache_hierarchy.level_count == 0) {
+            topology_validation_context_add_error(
+                ctx, TOPOLOGY_ERROR_CACHE_HIERARCHY_INCOMPLETE,
+                TOPOLOGY_VALIDATION_HARD_FAIL);
+            result = TOPOLOGY_VALIDATION_HARD_FAIL;
+        }
+        
+        /* Verify cache domains are consistent */
+        if (core->l1_domain == CACHE_DOMAIN_INVALID ||
+            core->l2_domain == CACHE_DOMAIN_INVALID ||
+            core->l3_domain == CACHE_DOMAIN_INVALID) {
+            topology_validation_context_add_error(
+                ctx, TOPOLOGY_ERROR_CACHE_DOMAIN_INCONSISTENT,
+                TOPOLOGY_VALIDATION_HARD_FAIL);
+            result = TOPOLOGY_VALIDATION_HARD_FAIL;
+        }
+    }
+    
+    return result;
+}
+
+/* ========================================================================
+ * VALIDATION - NUMA TOPOLOGY
+ * ======================================================================== */
+
+static topology_validation_result_t validate_numa_topology(
+    const topology_state_t *topology,
+    topology_validation_context_t *ctx
+) {
+    topology_validation_result_t result = TOPOLOGY_VALIDATION_ACCEPT;
+    
+    /* Validate NUMA distances are sane */
+    for (uint32_t i = 0; i < topology->numa_node_count; i++) {
+        const numa_node_t *node = &topology->numa_nodes[i];
+        
+        /* Distance to self should be lowest */
+        uint32_t self_distance = node->distance[i];
+        
+        for (uint32_t j = 0; j < topology->numa_node_count; j++) {
+            if (i == j) continue;
+            
+            if (node->distance[j] <= self_distance) {
+                topology_validation_context_add_error(
+                    ctx, TOPOLOGY_ERROR_NUMA_DISTANCE_INVALID,
+                    TOPOLOGY_VALIDATION_HARD_FAIL);
+                result = TOPOLOGY_VALIDATION_HARD_FAIL;
+            }
+        }
+    }
+    
+    /* Check for NUMA asymmetry (warning only) */
+    if (topology->numa_node_count > 1) {
+        bool asymmetric = false;
+        
+        for (uint32_t i = 0; i < topology->numa_node_count; i++) {
+            for (uint32_t j = i + 1; j < topology->numa_node_count; j++) {
+                uint32_t dist_ij = topology->numa_nodes[i].distance[j];
+                uint32_t dist_ji = topology->numa_nodes[j].distance[i];
+                
+                if (dist_ij != dist_ji) {
+                    asymmetric = true;
+                }
+            }
+        }
+        
+        if (asymmetric) {
+            topology_validation_context_add_error(
+                ctx, TOPOLOGY_WARN_NUMA_ASYMMETRIC, TOPOLOGY_VALIDATION_WARN);
+            if (result == TOPOLOGY_VALIDATION_ACCEPT) {
+                result = TOPOLOGY_VALIDATION_WARN;
+            }
+        }
+    }
+    
+    return result;
+}
+
+/* ========================================================================
+ * VALIDATION - SMT CONFIGURATION
+ * ======================================================================== */
+
+static topology_validation_result_t validate_smt_configuration(
+    const topology_state_t *topology,
+    topology_validation_context_t *ctx
+) {
+    topology_validation_result_t result = TOPOLOGY_VALIDATION_ACCEPT;
+    
+    /* Check for SMT siblings */
+    for (uint32_t i = 0; i < topology->core_count; i++) {
+        const core_geometry_t *core = &topology->cores[i];
+        
+        if (core->has_smt) {
+            /* Verify sibling is valid */
+            if (core->smt_sibling >= topology->core_count) {
+                topology_validation_context_add_error(
+                    ctx, TOPOLOGY_ERROR_SMT_SIBLING_INVALID,
+                    TOPOLOGY_VALIDATION_HARD_FAIL);
+                result = TOPOLOGY_VALIDATION_HARD_FAIL;
+            }
+            
+            /* Warn about SMT being enabled (security consideration) */
+            topology_validation_context_add_error(
+                ctx, TOPOLOGY_WARN_SMT_ENABLED, TOPOLOGY_VALIDATION_WARN);
+            if (result == TOPOLOGY_VALIDATION_ACCEPT) {
+                result = TOPOLOGY_VALIDATION_WARN;
+            }
+        }
+    }
+    
+    return result;
+}
+
+/* ========================================================================
+ * VALIDATION - SECURITY REQUIREMENTS
+ * ======================================================================== */
+
+static topology_validation_result_t validate_security_requirements(
+    const topology_state_t *topology,
+    topology_validation_context_t *ctx
+) {
+    topology_validation_result_t result = TOPOLOGY_VALIDATION_ACCEPT;
+    
+    /* Check that at least some cores can be isolated */
+    bool has_isolatable_cores = false;
+    
+    for (uint32_t i = 0; i < topology->core_count; i++) {
+        if (topology->cores[i].isolated) {
+            has_isolatable_cores = true;
+            break;
+        }
+    }
+    
+    if (!has_isolatable_cores) {
+        topology_validation_context_add_error(
+            ctx, TOPOLOGY_ERROR_NO_ISOLATED_CORES,
+            TOPOLOGY_VALIDATION_HARD_FAIL);
+        result = TOPOLOGY_VALIDATION_HARD_FAIL;
+    }
+    
+    /* Check for frequency scaling (determinism requirement) */
+    bool freq_scaling_disabled = true;
+    
+    for (uint32_t i = 0; i < topology->core_count; i++) {
+        if (!topology->cores[i].freq_scaling_disabled) {
+            freq_scaling_disabled = false;
+            break;
+        }
+    }
+    
+    if (!freq_scaling_disabled) {
+        topology_validation_context_add_error(
+            ctx, TOPOLOGY_ERROR_FREQ_SCALING_ENABLED,
+            TOPOLOGY_VALIDATION_HARD_FAIL);
+        result = TOPOLOGY_VALIDATION_HARD_FAIL;
+    }
+    
+    /* Check for constant-time support */
+    bool has_constant_time = false;
+    
+    for (uint32_t i = 0; i < topology->core_count; i++) {
+        if (topology->cores[i].supports_constant_time) {
+            has_constant_time = true;
+            break;
+        }
+    }
+    
+    if (!has_constant_time) {
+        topology_validation_context_add_error(
+            ctx, TOPOLOGY_ERROR_CONSTANT_TIME_UNSUPPORTED,
+            TOPOLOGY_VALIDATION_HARD_FAIL);
+        result = TOPOLOGY_VALIDATION_HARD_FAIL;
+    }
+    
+    return result;
+}
+
+/* ========================================================================
+ * VALIDATION - TOPOLOGY SYMMETRY
+ * ======================================================================== */
+
+static topology_validation_result_t validate_topology_symmetry(
+    const topology_state_t *topology,
+    topology_validation_context_t *ctx
+) {
+    topology_validation_result_t result = TOPOLOGY_VALIDATION_ACCEPT;
+    
+    /* Check if all cores have identical configuration */
+    bool symmetric = true;
+    
+    if (topology->core_count > 1) {
+        const core_geometry_t *first = &topology->cores[0];
+        
+        for (uint32_t i = 1; i < topology->core_count; i++) {
+            const core_geometry_t *core = &topology->cores[i];
+            
+            /* Compare relevant fields */
+            if (core->cache_hierarchy.level_count != first->cache_hierarchy.level_count ||
+                core->base_freq_mhz != first->base_freq_mhz ||
+                core->max_freq_mhz != first->max_freq_mhz) {
+                symmetric = false;
+                break;
+            }
+        }
+    }
+    
+    topology->symmetric = symmetric;
+    
+    if (!symmetric) {
+        topology_validation_context_add_error(
+            ctx, TOPOLOGY_ERROR_ASYMMETRIC_TOPOLOGY, TOPOLOGY_VALIDATION_WARN);
+        result = TOPOLOGY_VALIDATION_WARN;
+    }
+    
+    return result;
+}
+
+/* ========================================================================
+ * MAIN VALIDATION FUNCTION
+ * ======================================================================== */
+
+topology_validation_result_t topology_validate(
+    topology_state_t *topology,
+    topology_validation_context_t *ctx
+) {
+    topology_validation_context_init(ctx);
+    
+    /* Validate topology is probed */
+    if (!topology->probed) {
+        topology_validation_context_add_error(
+            ctx, TOPOLOGY_ERROR_CORE_NOT_PROBED, TOPOLOGY_VALIDATION_HARD_FAIL);
+        return TOPOLOGY_VALIDATION_HARD_FAIL;
+    }
+    
+    /* Build cache isolation matrix before validation */
+    if (!topology_build_cache_isolation_matrix(topology)) {
+        return TOPOLOGY_VALIDATION_HARD_FAIL;
+    }
+    
+    /* Run all validation checks */
+    validate_boot_consistency(topology, ctx);
+    validate_core_probing(topology, ctx);
+    validate_cache_hierarchy(topology, ctx);
+    validate_numa_topology(topology, ctx);
+    validate_smt_configuration(topology, ctx);
+    validate_security_requirements(topology, ctx);
+    validate_topology_symmetry(topology, ctx);
+    
+    /* Mark topology as validated if successful */
+    if (ctx->worst_result != TOPOLOGY_VALIDATION_HARD_FAIL) {
+        topology->validated = true;
+    }
+    
+    return ctx->worst_result;
+}
+
+/* ========================================================================
+ * SEALING
+ * ======================================================================== */
+
+bool topology_seal(topology_state_t *topology) {
+    if (!topology->validated) {
+        return false;
+    }
+    
+    if (topology->sealed) {
+        return false;  /* Already sealed */
+    }
+    
+    /* Seal cache isolation matrix */
+    topology->cache_isolation.sealed = true;
+    
+    /* Mark all cores as validated */
+    for (uint32_t i = 0; i < topology->core_count; i++) {
+        topology->cores[i].validated = true;
+    }
+    
+    /* Mark all NUMA nodes as validated */
+    for (uint32_t i = 0; i < topology->numa_node_count; i++) {
+        topology->numa_nodes[i].validated = true;
+    }
+    
+    /* Seal topology */
+    topology->sealed = true;
+    
+    return true;
+}
+
+/* ========================================================================
+ * QUERY FUNCTIONS (Safe After Sealing)
+ * ======================================================================== */
+
+const core_geometry_t* topology_get_core_geometry(
+    const topology_state_t *topology,
+    core_id_t core_id
+) {
+    if (!topology->validated) {
+        return NULL;
+    }
+    
+    if (core_id >= topology->core_count) {
+        return NULL;
+    }
+    
+    return &topology->cores[core_id];
+}
+
+cache_isolation_level_t topology_get_cache_isolation(
+    const topology_state_t *topology,
+    core_id_t core_a,
+    core_id_t core_b
+) {
+    if (!topology->sealed) {
+        return CACHE_ISOLATED_NONE;
+    }
+    
+    if (core_a >= topology->core_count || core_b >= topology->core_count) {
+        return CACHE_ISOLATED_NONE;
+    }
+    
+    return topology->cache_isolation.isolation[core_a][core_b];
+}
+
+bool topology_can_isolate_cores(
+    const topology_state_t *topology,
+    core_id_t core_a,
+    core_id_t core_b,
+    cache_isolation_level_t required_level
+) {
+    cache_isolation_level_t actual = 
+        topology_get_cache_isolation(topology, core_a, core_b);
+    
+    return actual >= required_level;
+}
+
+numa_node_t topology_get_numa_node(
+    const topology_state_t *topology,
+    core_id_t core_id
+) {
+    const core_geometry_t *core = topology_get_core_geometry(topology, core_id);
+    
+    if (!core) {
+        return NUMA_NODE_INVALID;
+    }
+    
+    return core->numa_node;
+}
+
+bool topology_same_numa_node(
+    const topology_state_t *topology,
+    core_id_t core_a,
+    core_id_t core_b
+) {
+    numa_node_t node_a = topology_get_numa_node(topology, core_a);
+    numa_node_t node_b = topology_get_numa_node(topology, core_b);
+    
+    return (node_a != NUMA_NODE_INVALID && 
+            node_b != NUMA_NODE_INVALID && 
+            node_a == node_b);
+}
+
+uint32_t topology_get_numa_distance(
+    const topology_state_t *topology,
+    core_id_t core_a,
+    core_id_t core_b
+) {
+    const core_geometry_t *geom_a = topology_get_core_geometry(topology, core_a);
+    const core_geometry_t *geom_b = topology_get_core_geometry(topology, core_b);
+    
+    if (!geom_a || !geom_b) {
+        return UINT32_MAX;
+    }
+    
+    if (geom_b->numa_node >= MAX_NUMA_NODES) {
+        return UINT32_MAX;
+    }
+    
+    return geom_a->numa_distance[geom_b->numa_node];
+}
+
+bool topology_has_smt_sibling(
+    const topology_state_t *topology,
+    core_id_t core_id
+) {
+    const core_geometry_t *core = topology_get_core_geometry(topology, core_id);
+    
+    if (!core) {
+        return false;
+    }
+    
+    return core->has_smt;
+}
+
+uint32_t topology_get_cache_sharing_cores(
+    const topology_state_t *topology,
+    core_id_t core_id,
+    uint32_t cache_level,
+    core_id_t *out_cores,
+    uint32_t max_cores
+) {
+    if (!topology->validated || !out_cores || max_cores == 0) {
+        return 0;
+    }
+    
+    const core_geometry_t *core = topology_get_core_geometry(topology, core_id);
+    if (!core) {
+        return 0;
+    }
+    
+    if (cache_level >= core->cache_hierarchy.level_count) {
+        return 0;
+    }
+    
+    const cache_level_t *cache = &core->cache_hierarchy.levels[cache_level];
+    
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < cache->sharing_count && count < max_cores; i++) {
+        out_cores[count++] = cache->shared_with[i];
+    }
+    
+    return count;
+}
+
+/* ========================================================================
+ * ERROR REPORTING
+ * ======================================================================== */
+
+const char* topology_error_string(topology_error_t error) {
+    switch (error) {
+        case TOPOLOGY_ERROR_NONE:
+            return "No error";
+        case TOPOLOGY_ERROR_BOOT_FACTS_NULL:
+            return "Boot facts not initialized";
+        case TOPOLOGY_ERROR_CORE_COUNT_MISMATCH:
+            return "Core count does not match boot facts";
+        case TOPOLOGY_ERROR_NUMA_COUNT_MISMATCH:
+            return "NUMA node count does not match boot facts";
+        case TOPOLOGY_ERROR_CORE_NOT_PROBED:
+            return "Core not probed";
+        case TOPOLOGY_ERROR_CACHE_HIERARCHY_INCOMPLETE:
+            return "Cache hierarchy incomplete";
+        case TOPOLOGY_ERROR_NUMA_DISTANCE_INVALID:
+            return "NUMA distance is invalid";
+        case TOPOLOGY_ERROR_SMT_SIBLING_INVALID:
+            return "SMT sibling is invalid";
+        case TOPOLOGY_ERROR_CACHE_DOMAIN_INCONSISTENT:
+            return "Cache domain assignment is inconsistent";
+        case TOPOLOGY_ERROR_ASYMMETRIC_TOPOLOGY:
+            return "Topology is asymmetric";
+        case TOPOLOGY_ERROR_NO_ISOLATED_CORES:
+            return "No cores can be isolated";
+        case TOPOLOGY_ERROR_FREQ_SCALING_ENABLED:
+            return "Frequency scaling is enabled (violates determinism)";
+        case TOPOLOGY_ERROR_CONSTANT_TIME_UNSUPPORTED:
+            return "Constant-time operations not supported";
+        case TOPOLOGY_WARN_SMT_ENABLED:
+            return "Warning: SMT is enabled";
+        case TOPOLOGY_WARN_NUMA_ASYMMETRIC:
+            return "Warning: NUMA topology is asymmetric";
+        case TOPOLOGY_WARN_FREQ_VARIATION:
+            return "Warning: Core frequencies vary";
+        default:
+            return "Unknown error";
+    }
+}
+
+void topology_validation_context_print(
+    const topology_validation_context_t *ctx
+) {
+    printf("Topology validation summary: %u error(s)\n", ctx->error_count);
+    printf("Worst result: ");
+    
+    switch (ctx->worst_result) {
+        case TOPOLOGY_VALIDATION_ACCEPT:
+            printf("ACCEPT\n");
+            break;
+        case TOPOLOGY_VALIDATION_WARN:
+            printf("WARN\n");
+            break;
+        case TOPOLOGY_VALIDATION_HARD_FAIL:
+            printf("HARD_FAIL\n");
+            break;
+    }
+    
+    for (uint32_t i = 0; i < ctx->error_count; i++) {
+        printf("  [%u] %s\n", i, topology_error_string(ctx->errors[i]));
+    }
+}

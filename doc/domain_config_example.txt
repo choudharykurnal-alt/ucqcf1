@@ -1,0 +1,328 @@
+# config/domain_layout.yaml
+#
+# UCQCF Phase-1 Domain Configuration
+#
+# CRITICAL RULES:
+#   - Every field must be explicitly set (no defaults)
+#   - Absence of field = validation failure
+#   - No overlapping core assignments
+#   - Dependency graph must be acyclic
+#   - All isolation requirements must be topology-satisfiable
+#
+# SECURITY PROPERTY:
+#   If this configuration validates, the system cannot violate
+#   trust boundaries through scheduling or memory access.
+
+# Global constraints (informational)
+constraints:
+  max_domains: 64
+  max_cores_per_domain: 256
+  max_dependencies: 32
+
+# Domain definitions
+domains:
+  # ======================================================================
+  # BOOT DOMAIN (Domain 0 - Special)
+  # ======================================================================
+  - id: 0
+    name: "boot_domain"
+    
+    # Security properties
+    security_level: 7  # Highest level (requirement-defined)
+    preemption: never  # Boot domain runs to completion
+    
+    # Core assignment
+    cores: [0]  # Single core for deterministic boot
+    
+    # Cache isolation
+    # Boot domain needs private cache to avoid state leakage
+    cache_isolation: full
+    
+    # Memory properties
+    memory_type: isolated
+    numa_local: true  # Must be on single NUMA node
+    
+    # Dependencies
+    dependencies: []  # Boot domain has no dependencies
+    
+  # ======================================================================
+  # CRYPTO DOMAIN (High Security)
+  # ======================================================================
+  - id: 1
+    name: "crypto_domain"
+    
+    # Security properties
+    security_level: 6  # Very high security
+    preemption: never  # Crypto operations must complete atomically
+    
+    # Core assignment
+    # Cores 4-7: Assumed to be on separate L3 cache from cores 0-3
+    cores: [4, 5, 6, 7]
+    
+    # Cache isolation
+    # Crypto domain requires full cache isolation to prevent timing attacks
+    cache_isolation: l3
+    
+    # Memory properties
+    memory_type: isolated  # No memory sharing with other domains
+    numa_local: true       # All cores must be on same NUMA node
+    
+    # Dependencies
+    dependencies: []  # Crypto domain is independent
+    
+  # ======================================================================
+  # KEY MANAGEMENT DOMAIN (Highest Security)
+  # ======================================================================
+  - id: 2
+    name: "key_mgmt_domain"
+    
+    # Security properties
+    security_level: 7  # Same as boot (highest)
+    preemption: never  # Key operations are atomic
+    
+    # Core assignment
+    # Single core, fully isolated
+    cores: [8]
+    
+    # Cache isolation
+    cache_isolation: full  # No shared cache at any level
+    
+    # Memory properties
+    memory_type: isolated
+    numa_local: true
+    
+    # Dependencies
+    # Key management depends on crypto domain for operations
+    dependencies: [1]
+    
+  # ======================================================================
+  # NETWORK DOMAIN (Lower Security, High Performance)
+  # ======================================================================
+  - id: 3
+    name: "network_domain"
+    
+    # Security properties
+    security_level: 2  # Lower security for untrusted data
+    preemption: by_higher  # Can be preempted by higher security domains
+    
+    # Core assignment
+    # Cores 0-1: Separate from crypto cores
+    cores: [0, 1]
+    
+    # Cache isolation
+    # Network can share L3 (better performance for DMA)
+    cache_isolation: l2
+    
+    # Memory properties
+    memory_type: shared_read  # Can read from shared buffers
+    numa_local: false         # May span NUMA nodes for bandwidth
+    
+    # Dependencies
+    dependencies: []  # Network is leaf domain
+    
+  # ======================================================================
+  # VALIDATION DOMAIN (Medium Security)
+  # ======================================================================
+  - id: 4
+    name: "validation_domain"
+    
+    # Security properties
+    security_level: 4  # Medium security
+    preemption: by_higher
+    
+    # Core assignment
+    cores: [2, 3]
+    
+    # Cache isolation
+    cache_isolation: l2
+    
+    # Memory properties
+    memory_type: shared_read  # Reads from network, writes to crypto
+    numa_local: true
+    
+    # Dependencies
+    # Validation depends on network (receives data)
+    # and crypto (sends validated data)
+    dependencies: [3, 1]
+    
+  # ======================================================================
+  # STORAGE DOMAIN (Medium Security, High Throughput)
+  # ======================================================================
+  - id: 5
+    name: "storage_domain"
+    
+    # Security properties
+    security_level: 3
+    preemption: by_same  # Can be preempted by same or higher level
+    
+    # Core assignment
+    cores: [9, 10, 11]
+    
+    # Cache isolation
+    cache_isolation: l2
+    
+    # Memory properties
+    memory_type: shared_write  # Needs write access to buffers
+    numa_local: true
+    
+    # Dependencies
+    # Storage depends on crypto (encrypted writes)
+    dependencies: [1]
+    
+  # ======================================================================
+  # AUDIT DOMAIN (High Integrity, Lower Performance)
+  # ======================================================================
+  - id: 6
+    name: "audit_domain"
+    
+    # Security properties
+    security_level: 5  # High integrity required
+    preemption: by_higher
+    
+    # Core assignment
+    cores: [12]  # Single core, dedicated
+    
+    # Cache isolation
+    cache_isolation: full  # Audit must be isolated
+    
+    # Memory properties
+    memory_type: isolated  # Audit log isolation critical
+    numa_local: true
+    
+    # Dependencies
+    # Audit observes all domains except boot
+    dependencies: [1, 2, 3, 4, 5]
+    
+  # ======================================================================
+  # MONITORING DOMAIN (Observability, Lower Security)
+  # ======================================================================
+  - id: 7
+    name: "monitoring_domain"
+    
+    # Security properties
+    security_level: 1  # Lowest security (aggregated data only)
+    preemption: by_any  # Can always be preempted
+    
+    # Core assignment
+    cores: [13]
+    
+    # Cache isolation
+    cache_isolation: none  # Can share cache for efficiency
+    
+    # Memory properties
+    memory_type: shared_read  # Read-only access to metrics
+    numa_local: false
+    
+    # Dependencies
+    dependencies: []  # Monitoring is passive
+
+
+# ======================================================================
+# VALIDATION RULES (Checked at Boot)
+# ======================================================================
+
+validation_rules:
+  # Core overlap checking
+  - rule: no_core_overlap
+    severity: hard_fail
+    description: "No core can be assigned to multiple domains"
+    
+  # Dependency graph checking
+  - rule: acyclic_dependencies
+    severity: hard_fail
+    description: "Dependency graph must be acyclic"
+    
+  # Topology constraints
+  - rule: cache_isolation_satisfiable
+    severity: hard_fail
+    description: "All cache isolation requirements must be achievable"
+    
+  - rule: numa_constraints_satisfiable
+    severity: hard_fail
+    description: "NUMA locality constraints must be satisfiable"
+    
+  # Field completeness
+  - rule: all_fields_explicit
+    severity: hard_fail
+    description: "Every field must be explicitly set (no defaults)"
+    
+  # Warnings (non-fatal)
+  - rule: unused_cores
+    severity: warn
+    description: "Warn if cores exist but are unassigned"
+    
+  - rule: asymmetric_topology
+    severity: warn
+    description: "Warn if topology is asymmetric"
+
+
+# ======================================================================
+# EXPECTED TOPOLOGY (For Validation)
+# ======================================================================
+#
+# This configuration assumes the following hardware topology:
+#
+# - 16 cores total (0-15)
+# - 2 NUMA nodes:
+#   - Node 0: Cores 0-7
+#   - Node 1: Cores 8-15
+# - Cache hierarchy:
+#   - L1: Private per core
+#   - L2: Shared by pairs (0-1, 2-3, 4-5, 6-7, 8-9, 10-11, 12-13, 14-15)
+#   - L3: Shared by groups of 8 (0-7, 8-15)
+#
+# If actual topology differs, validation MUST fail.
+#
+# ======================================================================
+
+
+# ======================================================================
+# CONFIGURATION INTEGRITY
+# ======================================================================
+
+integrity:
+  # Checksum of this configuration (computed by parser)
+  checksum: "SHA256:<computed_at_parse_time>"
+  
+  # Configuration version
+  version: "1.0.0"
+  
+  # Requirement document this implements
+  requirement_doc: "UCQCF-REQ-001-Phase1"
+  
+  # Last modified (for audit)
+  last_modified: "2025-01-05T00:00:00Z"
+  
+  # Validated by (before deployment)
+  validated_by: "security_team"
+
+
+# ======================================================================
+# ANTI-PATTERNS TO AVOID (Documentation)
+# ======================================================================
+#
+# 1. NEVER use default values:
+#    ❌ cores: []  # Empty means "assign later" - WRONG
+#    ✅ cores: [0, 1, 2, 3]  # Explicit - CORRECT
+#
+# 2. NEVER create circular dependencies:
+#    ❌ domain_a depends on domain_b
+#       domain_b depends on domain_a
+#    ✅ Create acyclic dependency graph
+#
+# 3. NEVER assign same core to multiple domains:
+#    ❌ domain_a: cores: [0, 1]
+#       domain_b: cores: [1, 2]  # Core 1 overlap!
+#    ✅ domain_a: cores: [0, 1]
+#       domain_b: cores: [2, 3]
+#
+# 4. NEVER request unsatisfiable cache isolation:
+#    ❌ cache_isolation: full
+#       cores: [0, 1]  # If 0 and 1 share L3!
+#    ✅ Check topology before specifying cores
+#
+# 5. NEVER omit security level:
+#    ❌ security_level: <not specified>
+#    ✅ security_level: 4  # Explicit
+#
+# ======================================================================

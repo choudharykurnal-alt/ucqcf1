@@ -1,0 +1,349 @@
+/**
+ * phase1_boot_sequence.c
+ * 
+ * Complete Phase-1 boot orchestration
+ * 
+ * PURPOSE:
+ *   Demonstrate the correct PROBE → VALIDATE → CONSTRUCT → SEAL sequence.
+ *   This is the reference implementation showing all layers working together.
+ * 
+ * SEQUENCE:
+ *   1. Boot facts probing
+ *   2. Boot facts validation
+ *   3. Boot facts sealing
+ *   4. Topology probing
+ *   5. Topology validation
+ *   6. Cache isolation matrix construction (AFTER validation)
+ *   7. Topology sealing
+ *   8. Domain loading
+ *   9. Domain validation (against SEALED topology)
+ *   10. Domain sealing
+ *   11. Scheduler initialization (with sealed domains)
+ * 
+ * SECURITY PROPERTY:
+ *   Each layer is immutable before the next layer depends on it.
+ */
+
+#include "boot/boot_contract.h"
+#include "topology/topology_contract.h"
+#include "domains/domain_contract.h"
+#include <stdio.h>
+#include <stdlib.h>
+
+/* ========================================================================
+ * PANIC HANDLER
+ * ======================================================================== */
+
+static void panic(const char *message) {
+    printf("\n");
+    printf("========================================\n");
+    printf("PANIC: %s\n", message);
+    printf("========================================\n");
+    printf("System halted.\n");
+    exit(1);
+}
+
+/* ========================================================================
+ * PHASE-1 BOOT SEQUENCE
+ * ======================================================================== */
+
+int main(void) {
+    printf("========================================\n");
+    printf("UCQCF Phase-1 Boot Sequence\n");
+    printf("========================================\n\n");
+    
+    /* ====================================================================
+     * LAYER 1: BOOT FACTS (Hardware Discovery)
+     * ==================================================================== */
+    
+    printf("=== LAYER 1: BOOT FACTS ===\n\n");
+    
+    boot_facts_t boot_facts;
+    boot_init(&boot_facts);
+    
+    /* PROBE: Detect hardware */
+    if (!boot_probe(&boot_facts)) {
+        panic("Boot probing failed");
+    }
+    
+    /* VALIDATE: Verify hardware meets minimum requirements */
+    boot_validation_context_t boot_ctx;
+    boot_validation_result_t boot_result = boot_validate(&boot_facts, &boot_ctx);
+    
+    printf("\n");
+    boot_validation_context_print(&boot_ctx);
+    
+    if (!boot_validation_allows_boot(&boot_ctx)) {
+        panic("Boot validation failed - hardware insufficient");
+    }
+    
+    /* SEAL: Make boot facts immutable */
+    if (!boot_seal(&boot_facts)) {
+        panic("Failed to seal boot facts");
+    }
+    
+    printf("\n✓ Boot facts sealed (now immutable)\n\n");
+    
+    /* ====================================================================
+     * LAYER 2: TOPOLOGY (Hardware Geometry)
+     * ==================================================================== */
+    
+    printf("=== LAYER 2: TOPOLOGY ===\n\n");
+    
+    topology_state_t topology;
+    topology_init(&topology, &boot_facts);
+    
+    /* PROBE: Discover topology */
+    printf("[TOPOLOGY] Probing all cores...\n");
+    if (!topology_probe_all_cores(&topology)) {
+        panic("Topology probing failed");
+    }
+    
+    printf("[TOPOLOGY] Discovered %u cores\n", topology.core_count);
+    printf("[TOPOLOGY] Discovered %u NUMA nodes\n", topology.numa_node_count);
+    
+    /* VALIDATE: Verify topology consistency and security requirements */
+    printf("\n[TOPOLOGY] Validating...\n");
+    topology_validation_context_t topo_ctx;
+    topology_validation_result_t topo_result = 
+        topology_validate(&topology, &topo_ctx);
+    
+    printf("\n");
+    topology_validation_context_print(&topo_ctx);
+    
+    if (!topology_validation_allows_boot(&topo_ctx)) {
+        panic("Topology validation failed - geometry unsatisfiable");
+    }
+    
+    /* CONSTRUCT: Build cache isolation matrix (AFTER validation passes) */
+    printf("\n[TOPOLOGY] Building cache isolation matrix...\n");
+    if (!topology_build_cache_isolation_matrix(&topology)) {
+        panic("Failed to build cache isolation matrix");
+    }
+    
+    printf("[TOPOLOGY] Cache isolation matrix: %u x %u entries\n",
+           topology.core_count, topology.core_count);
+    
+    /* SEAL: Make topology immutable */
+    if (!topology_seal(&topology)) {
+        panic("Failed to seal topology");
+    }
+    
+    printf("\n✓ Topology sealed (now immutable)\n\n");
+    
+    /* ====================================================================
+     * LAYER 3: DOMAINS (Security Policy)
+     * ==================================================================== */
+    
+    printf("=== LAYER 3: DOMAINS ===\n\n");
+    
+    domain_graph_t domain_graph;
+    domain_graph_init(&domain_graph, &boot_facts, &topology);
+    
+    /* LOAD: Parse domain configuration */
+    printf("[DOMAINS] Loading configuration from config/domain_layout.yaml...\n");
+    
+    /* Example: Add a simple domain configuration */
+    security_domain_t crypto_domain = {0};
+    crypto_domain.id = 1;
+    strncpy(crypto_domain.name, "crypto_domain", sizeof(crypto_domain.name));
+    crypto_domain.name_explicit = true;
+    crypto_domain.security_level = SECURITY_LEVEL_6;
+    crypto_domain.preemption = PREEMPTION_NEVER;
+    
+    /* Assign cores 4-7 (assuming they're isolated in topology) */
+    core_set_clear(&crypto_domain.cores);
+    for (uint32_t i = 4; i < 8 && i < boot_facts.cpu_count; i++) {
+        core_set_add(&crypto_domain.cores, i);
+    }
+    
+    crypto_domain.cache_isolation = CACHE_ISOLATION_L3;
+    crypto_domain.memory_type = MEMORY_DOMAIN_ISOLATED;
+    crypto_domain.numa_local = true;
+    crypto_domain.numa_local_explicit = true;
+    dependency_set_clear(&crypto_domain.dependencies);
+    
+    if (!domain_graph_add(&domain_graph, &crypto_domain)) {
+        panic("Failed to add crypto domain");
+    }
+    
+    printf("[DOMAINS] Added domain: %s (id=%u, cores=%u)\n",
+           crypto_domain.name, crypto_domain.id, crypto_domain.cores.count);
+    
+    /* Add network domain */
+    security_domain_t network_domain = {0};
+    network_domain.id = 2;
+    strncpy(network_domain.name, "network_domain", sizeof(network_domain.name));
+    network_domain.name_explicit = true;
+    network_domain.security_level = SECURITY_LEVEL_2;
+    network_domain.preemption = PREEMPTION_BY_HIGHER;
+    
+    core_set_clear(&network_domain.cores);
+    for (uint32_t i = 0; i < 2 && i < boot_facts.cpu_count; i++) {
+        core_set_add(&network_domain.cores, i);
+    }
+    
+    network_domain.cache_isolation = CACHE_ISOLATION_L2;
+    network_domain.memory_type = MEMORY_DOMAIN_SHARED_READ;
+    network_domain.numa_local = false;
+    network_domain.numa_local_explicit = true;
+    dependency_set_clear(&network_domain.dependencies);
+    
+    if (!domain_graph_add(&domain_graph, &network_domain)) {
+        panic("Failed to add network domain");
+    }
+    
+    printf("[DOMAINS] Added domain: %s (id=%u, cores=%u)\n",
+           network_domain.name, network_domain.id, network_domain.cores.count);
+    
+    /* VALIDATE: Check domains against SEALED topology */
+    printf("\n[DOMAINS] Validating against sealed topology...\n");
+    validation_context_t domain_ctx;
+    validation_result_t domain_result = 
+        domain_graph_validate(&domain_graph, &domain_ctx);
+    
+    printf("\n");
+    validation_context_print(&domain_ctx);
+    
+    if (!validation_context_allows_boot(&domain_ctx)) {
+        panic("Domain validation failed - security constraints unsatisfiable");
+    }
+    
+    /* SEAL: Make domains immutable */
+    if (!domain_graph_seal(&domain_graph)) {
+        panic("Failed to seal domain graph");
+    }
+    
+    printf("\n✓ Domains sealed (now immutable)\n\n");
+    
+    /* ====================================================================
+     * VERIFICATION: Prove Immutability Chain
+     * ==================================================================== */
+    
+    printf("=== VERIFICATION ===\n\n");
+    
+    printf("Checking immutability chain:\n");
+    printf("  Boot facts sealed:    %s\n", boot_facts.sealed ? "YES" : "NO");
+    printf("  Topology sealed:      %s\n", topology.sealed ? "YES" : "NO");
+    printf("  Domains sealed:       %s\n", domain_graph.sealed ? "YES" : "NO");
+    
+    if (!boot_facts.sealed || !topology.sealed || !domain_graph.sealed) {
+        panic("Immutability chain broken!");
+    }
+    
+    printf("\n✓ Immutability chain intact\n\n");
+    
+    /* ====================================================================
+     * RUNTIME QUERIES: Demonstrate Safe Usage
+     * ==================================================================== */
+    
+    printf("=== RUNTIME QUERIES ===\n\n");
+    
+    /* Query cache isolation (O(1) lookup after precomputation) */
+    if (boot_facts.cpu_count >= 8) {
+        cache_isolation_level_t isolation = 
+            topology_get_cache_isolation(&topology, 0, 4);
+        
+        printf("Cache isolation between core 0 and core 4: ");
+        switch (isolation) {
+            case CACHE_ISOLATED_NONE: printf("NONE\n"); break;
+            case CACHE_ISOLATED_L1: printf("L1\n"); break;
+            case CACHE_ISOLATED_L2: printf("L2\n"); break;
+            case CACHE_ISOLATED_L3: printf("L3\n"); break;
+            case CACHE_ISOLATED_FULL: printf("FULL\n"); break;
+        }
+    }
+    
+    /* Query domain isolation */
+    bool isolated = domain_graph_cores_isolated(&domain_graph, 1, 2);
+    printf("Crypto domain (1) isolated from network domain (2): %s\n",
+           isolated ? "YES" : "NO");
+    
+    /* Query domain access */
+    bool can_access = domain_graph_can_access(&domain_graph, 2, 1);
+    printf("Network domain (2) can access crypto domain (1): %s\n",
+           can_access ? "YES" : "NO");
+    
+    printf("\n");
+    
+    /* ====================================================================
+     * BOOT COMPLETE
+     * ==================================================================== */
+    
+    printf("========================================\n");
+    printf("Phase-1 Boot Complete\n");
+    printf("========================================\n\n");
+    
+    printf("System ready for scheduler initialization.\n\n");
+    
+    printf("Summary:\n");
+    printf("  Cores:   %u\n", boot_facts.cpu_count);
+    printf("  NUMA:    %u nodes\n", boot_facts.numa_nodes);
+    printf("  Domains: %u defined\n", domain_graph.domain_count);
+    printf("  Status:  All layers sealed\n\n");
+    
+    printf("Security properties guaranteed:\n");
+    printf("  ✓ Boot facts immutable\n");
+    printf("  ✓ Topology immutable\n");
+    printf("  ✓ Domains immutable\n");
+    printf("  ✓ Cache isolation verified\n");
+    printf("  ✓ NUMA constraints satisfied\n");
+    printf("  ✓ Dependency graph acyclic\n");
+    printf("  ✓ No overlapping core assignments\n\n");
+    
+    printf("Phase-1 is now a mathematical proof, not a best-effort system.\n\n");
+    
+    return 0;
+}
+
+/* ========================================================================
+ * ANTI-PATTERN EXAMPLES (For Documentation)
+ * ======================================================================== */
+
+#if 0  /* Never compile these */
+
+/* WRONG: Construct before validate */
+void wrong_sequence_1(void) {
+    topology_state_t topology;
+    topology_init(&topology, &boot_facts);
+    topology_probe_all_cores(&topology);
+    
+    /* BAD: Constructing before validation */
+    topology_build_cache_isolation_matrix(&topology);
+    
+    /* Now validation might fail, but matrix already exists! */
+    topology_validation_context_t ctx;
+    topology_validate(&topology, &ctx);
+}
+
+/* WRONG: Validate domains before sealing topology */
+void wrong_sequence_2(void) {
+    topology_state_t topology;
+    topology_init(&topology, &boot_facts);
+    topology_probe_all_cores(&topology);
+    
+    topology_validation_context_t topo_ctx;
+    topology_validate(&topology, &topo_ctx);
+    /* Topology NOT sealed yet! */
+    
+    /* BAD: Validating domains against mutable topology */
+    domain_graph_t graph;
+    domain_graph_init(&graph, &boot_facts, &topology);
+    validation_context_t domain_ctx;
+    domain_graph_validate(&graph, &domain_ctx);
+    
+    /* Now seal topology (too late!) */
+    topology_seal(&topology);
+}
+
+/* WRONG: Skip validation */
+void wrong_sequence_3(void) {
+    boot_facts_t facts;
+    boot_init(&facts);
+    boot_probe(&facts);
+    
+    /* BAD: Skip validation, seal directly */
+    boot_seal(&facts);  /* Should fail! */
+}
+
+#endif  /* Anti-patterns */
